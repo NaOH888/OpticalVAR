@@ -73,6 +73,32 @@ class ConditionalVAESmokeTests(unittest.TestCase):
         self.assertEqual(tuple(decoded.shape), (2, 1, 32, 32))
         self.assertTrue(torch.isfinite(output.loss))
 
+    def test_forward_and_decode_support_four_level_hierarchy(self) -> None:
+        model = build_cvae(
+            {
+                "input_channels": 1,
+                "image_size": 32,
+                "latent_height": 4,
+                "latent_width": 4,
+                "condition_mode": "class_index",
+                "num_classes": 10,
+                "condition_embed_dim": 8,
+                "condition_channels": 2,
+                "encoder_hidden_channels": [16, 32, 64, 128],
+                "decoder_hidden_channels": [128, 64, 32, 16],
+                "reconstruction_loss": "bce",
+            }
+        )
+        batch = {
+            "data": torch.rand((2, 1, 32, 32), dtype=torch.float32),
+            "labels": torch.tensor([1, 4], dtype=torch.long),
+        }
+        output = model(batch)
+        decoded = model.decode(output.z, batch["labels"])
+        self.assertEqual(tuple(output.recon_x.shape), (2, 1, 32, 32))
+        self.assertEqual(tuple(decoded.shape), (2, 1, 32, 32))
+        self.assertTrue(torch.isfinite(output.loss))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,7 +22,7 @@ class ConditionalEncoder(BaseEncoder):
         condition_embed_dim: int,
         condition_hidden_dim: int | None,
         condition_channels: int,
-        hidden_channels: tuple[int, int, int],
+        hidden_channels: tuple[int, ...],
     ) -> None:
         super().__init__()
         self.image_size = int(image_size)
@@ -34,17 +34,23 @@ class ConditionalEncoder(BaseEncoder):
             embed_dim=int(condition_embed_dim),
             hidden_dim=condition_hidden_dim,
         )
-        c1, c2, c3 = (int(v) for v in hidden_channels)
-        self.features = nn.Sequential(
-            nn.Conv2d(int(input_channels) + int(condition_channels), c1, kernel_size=4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(c1, c2, kernel_size=4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(c2, c3, kernel_size=4, stride=2, padding=1),
-            nn.SiLU(),
-        )
-        feature_size = self.image_size // 8
-        flattened_dim = c3 * feature_size * feature_size
+        channels = tuple(int(v) for v in hidden_channels)
+        if len(channels) == 0:
+            raise ValueError("hidden_channels must contain at least one value")
+        downsample_factor = 2 ** len(channels)
+        if self.image_size % downsample_factor != 0:
+            raise ValueError(
+                f"image_size={self.image_size} must be divisible by 2**len(hidden_channels)={downsample_factor}"
+            )
+        layers: list[nn.Module] = []
+        in_channels = int(input_channels) + int(condition_channels)
+        for out_channels in channels:
+            layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1))
+            layers.append(nn.SiLU())
+            in_channels = out_channels
+        self.features = nn.Sequential(*layers)
+        feature_size = self.image_size // downsample_factor
+        flattened_dim = channels[-1] * feature_size * feature_size
         self.to_mu = nn.Linear(flattened_dim, int(latent_dim))
         self.to_log_var = nn.Linear(flattened_dim, int(latent_dim))
 
@@ -70,7 +76,7 @@ class ConditionalDecoder(BaseDecoder):
         condition_input_dim: int | None,
         condition_embed_dim: int,
         condition_hidden_dim: int | None,
-        hidden_channels: tuple[int, int, int],
+        hidden_channels: tuple[int, ...],
     ) -> None:
         super().__init__()
         self.image_size = int(image_size)
@@ -82,18 +88,24 @@ class ConditionalDecoder(BaseDecoder):
             embed_dim=int(condition_embed_dim),
             hidden_dim=condition_hidden_dim,
         )
-        c1, c2, c3 = (int(v) for v in hidden_channels)
-        feature_size = self.image_size // 8
-        self.fc = nn.Linear(int(latent_dim) + int(condition_embed_dim), c1 * feature_size * feature_size)
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(c1, c2, kernel_size=4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.ConvTranspose2d(c2, c3, kernel_size=4, stride=2, padding=1),
-            nn.SiLU(),
-            nn.ConvTranspose2d(c3, int(output_channels), kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid(),
-        )
-        self.feature_channels = c1
+        channels = tuple(int(v) for v in hidden_channels)
+        if len(channels) == 0:
+            raise ValueError("hidden_channels must contain at least one value")
+        upsample_factor = 2 ** len(channels)
+        if self.image_size % upsample_factor != 0:
+            raise ValueError(
+                f"image_size={self.image_size} must be divisible by 2**len(hidden_channels)={upsample_factor}"
+            )
+        feature_size = self.image_size // upsample_factor
+        self.fc = nn.Linear(int(latent_dim) + int(condition_embed_dim), channels[0] * feature_size * feature_size)
+        layers: list[nn.Module] = []
+        for in_channels, out_channels in zip(channels[:-1], channels[1:]):
+            layers.append(nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1))
+            layers.append(nn.SiLU())
+        layers.append(nn.ConvTranspose2d(channels[-1], int(output_channels), kernel_size=4, stride=2, padding=1))
+        layers.append(nn.Sigmoid())
+        self.decoder = nn.Sequential(*layers)
+        self.feature_channels = channels[0]
         self.feature_size = feature_size
 
     def forward(self, z: torch.Tensor, labels: torch.Tensor) -> ModelOutput:
