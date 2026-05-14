@@ -1,0 +1,38 @@
+{
+  "runtime": {
+    "seed": 42,
+    "device": "cuda"
+  },
+  "dataset": {
+    "manifest_path": "dataset/celeba/celeba_train_gray_176.json",
+    "channel_mode": "keep",
+    "batch_size": 128,
+    "shuffle": true,
+    "num_workers": 0,
+    "max_items": null
+  },
+  "model": {
+    "input_channels": 1,
+    "image_size": 176,
+    "latent_height": 8,
+    "latent_width": 8,
+    "condition_mode": "attribute_vector",
+    "condition_input_dim": 40,
+    "condition_embed_dim": 64,
+    "condition_hidden_dim": 256,
+    "condition_channels": 32,
+    "encoder_hidden_channels": [128, 256, 512],
+    "decoder_hidden_channels": [512, 256, 128],
+    "reconstruction_loss": "bce"
+  },
+  "training": {
+    "epochs": 100,
+    "lr": 0.0001,
+    "weight_decay": 0.0,
+    "kl_weight": 0.5,
+    "log_interval": 50,
+    "max_steps_per_epoch": null,
+    "save_every_epoch": null,
+    "output_dir": "outputs/train_cvae/celeba_gray_176"
+  }
+}

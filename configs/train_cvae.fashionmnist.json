@@ -1,0 +1,36 @@
+{
+  "runtime": {
+    "seed": 42,
+    "device": "cuda"
+  },
+  "dataset": {
+    "manifest_path": "dataset/fashionmnist/fashionmnist.json",
+    "channel_mode": "mean",
+    "batch_size": 64,
+    "shuffle": true,
+    "num_workers": 0,
+    "max_items": null
+  },
+  "model": {
+    "input_channels": 1,
+    "image_size": 32,
+    "latent_height": 4,
+    "latent_width": 4,
+    "num_classes": 10,
+    "class_embed_dim": 32,
+    "condition_channels": 16,
+    "encoder_hidden_channels": [64, 128, 256],
+    "decoder_hidden_channels": [256, 128, 64],
+    "reconstruction_loss": "bce"
+  },
+  "training": {
+    "epochs": 100,
+    "lr": 0.0001,
+    "weight_decay": 0.0,
+    "kl_weight": 0.5,
+    "log_interval": 50,
+    "max_steps_per_epoch": null,
+    "save_every_epoch": null,
+    "output_dir": "outputs/train_cvae/fashionmnist_example"
+  }
+}

@@ -1,0 +1,18 @@
+.idea/
+.venv/
+docs/
+outputs/
+
+__pycache__/
+*.py[cod]
+
+# Local scratch / ad-hoc scripts
+src/scripts/test.py
+
+# Generated or local-only datasets
+dataset/*
+dataset/celeba/
+dataset/fashionmnist_cvae_pairs/
+dataset/600nm_Si_1000nm_SiO2/
+dataset/fashionmnist/
+

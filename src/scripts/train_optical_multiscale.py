@@ -1,0 +1,527 @@
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import sys
+from pathlib import Path
+from typing import Any
+
+import torch
+from torch.utils.data import DataLoader
+
+if __package__ in {None, ""}:
+    SRC_ROOT = Path(__file__).resolve().parents[1]
+    if str(SRC_ROOT) not in sys.path:
+        sys.path.insert(0, str(SRC_ROOT))
+
+from optical.core import DetectorConfig, PropagationConfig, PropagationErrorConfig, SourceConfig
+from optical.data import FrequencyPathDataset, MultiScaleFrequencyTargetTransform, NpzImageDataset
+from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
+from optical.losses import OpticalMultiscaleLoss
+from optical.models import ConditionalPhaseSLMEncoder, OpticalMultiscaleModel, OpticalPrefixReadoutDecoder
+
+
+def _load_config(config_path: Path) -> dict[str, Any]:
+    suffix = config_path.suffix.lower()
+    if suffix == ".json":
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    if suffix in {".yml", ".yaml"}:
+        try:
+            import yaml  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError("PyYAML is required to load YAML configs") from exc
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError(f"config root must be a mapping, got {type(payload).__name__}")
+        return payload
+    raise ValueError(f"Unsupported config format: {config_path.suffix}")
+
+
+def _resolve_path(path_value: str, *, config_dir: Path, repo_root: Path) -> Path:
+    candidate = Path(path_value)
+    if candidate.is_absolute():
+        return candidate
+    config_relative = (config_dir / candidate).resolve()
+    if config_relative.exists():
+        return config_relative
+    return (repo_root / candidate).resolve()
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _build_dataset_and_loader(
+    config: dict[str, Any],
+    *,
+    config_dir: Path,
+    repo_root: Path,
+) -> tuple[FrequencyPathDataset, DataLoader, MultiScaleFrequencyTargetTransform]:
+    dataset_cfg = dict(config["dataset"])
+    multiscale_cfg = dict(config["multiscale"])
+    dataset_path = _resolve_path(dataset_cfg["manifest_path"], config_dir=config_dir, repo_root=repo_root)
+    base_dataset = NpzImageDataset.from_manifest(
+        dataset_path,
+        max_items=dataset_cfg.get("max_items"),
+        channel_mode=str(dataset_cfg.get("channel_mode", "keep")),
+    )
+    target_transform = MultiScaleFrequencyTargetTransform(
+        num_levels=int(multiscale_cfg["num_levels"]),
+        max_freq_fraction=float(multiscale_cfg.get("max_freq_fraction", 1.0)),
+        transition_width=float(multiscale_cfg.get("transition_width", 0.05)),
+    )
+    dataset = FrequencyPathDataset(
+        base_dataset,
+        target_transform,
+        image_key="image",
+        label_key="label",
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=int(dataset_cfg.get("batch_size", 8)),
+        shuffle=bool(dataset_cfg.get("shuffle", True)),
+        num_workers=int(dataset_cfg.get("num_workers", 0)),
+        drop_last=bool(dataset_cfg.get("drop_last", False)),
+    )
+    return dataset, loader, target_transform
+
+
+def _expand_between_layer_distances(raw_value: Any, *, num_levels: int) -> tuple[float, ...]:
+    if num_levels <= 1:
+        return ()
+    if isinstance(raw_value, (int, float)):
+        return tuple(float(raw_value) for _ in range(num_levels - 1))
+    values = tuple(float(item) for item in raw_value)
+    if len(values) != num_levels - 1:
+        raise ValueError(
+            f"distance_between_layers_m must have length {num_levels - 1}, got {len(values)}"
+        )
+    return values
+
+
+def _build_initial_phase_map(
+    *,
+    phase_cfg: dict[str, Any],
+    source_cfg: SourceConfig,
+    phase_grid_height: int,
+    phase_grid_width: int,
+) -> torch.Tensor:
+    init_mode = str(phase_cfg.get("init_mode", "constant"))
+    share_across_channels = bool(phase_cfg.get("share_across_channels", True))
+    channels = 1 if share_across_channels else len(source_cfg.wavelengths_m)
+    alpha_pi = float(phase_cfg.get("alpha_pi", 2.0))
+    phase_period_rad = alpha_pi * float(torch.pi)
+    shape = (channels, phase_grid_height, phase_grid_width) if channels > 1 else (phase_grid_height, phase_grid_width)
+
+    if init_mode == "constant":
+        initial_phase_value_rad = float(phase_cfg.get("initial_phase_value_rad", 0.0))
+        return torch.full(shape, fill_value=initial_phase_value_rad, dtype=torch.float32)
+    if init_mode == "uniform":
+        init_min_rad = float(phase_cfg.get("init_min_rad", 0.0))
+        init_max_rad = float(phase_cfg.get("init_max_rad", phase_period_rad))
+        if init_max_rad <= init_min_rad:
+            raise ValueError(
+                f"phase init range must satisfy init_max_rad > init_min_rad, got {(init_min_rad, init_max_rad)}"
+            )
+        return torch.empty(shape, dtype=torch.float32).uniform_(init_min_rad, init_max_rad)
+    raise ValueError(f"Unsupported phase init_mode: {init_mode!r}")
+
+
+def _build_model(
+    config: dict[str, Any],
+    *,
+    sample_target: torch.Tensor,
+) -> OpticalMultiscaleModel:
+    multiscale_cfg = dict(config["multiscale"])
+    optical_cfg = dict(config["optical"])
+    encoder_cfg = dict(config["encoder"])
+    num_levels = int(multiscale_cfg["num_levels"])
+
+    source_cfg = SourceConfig(
+        wavelengths_m=tuple(float(value) for value in optical_cfg["source"]["wavelengths_m"]),
+        light_mode=str(optical_cfg["source"]["light_mode"]),
+        amplitude=float(optical_cfg["source"]["amplitude"]),
+    )
+    slm_cfg = dict(optical_cfg["slm"])
+    slm = SLMDeviceLayer(
+        pixel_pitch_x_m=float(slm_cfg["pixel_pitch_x_m"]),
+        pixel_pitch_y_m=float(slm_cfg["pixel_pitch_y_m"]),
+        pixel_count_x=int(slm_cfg["pixel_count_x"]),
+        pixel_count_y=int(slm_cfg["pixel_count_y"]),
+        dx=float(slm_cfg["dx_m"]),
+        fill_factor=float(slm_cfg.get("fill_factor", 1.0)),
+        phase_alpha=float(slm_cfg.get("phase_alpha", 2.0)),
+        phase_bit_depth=slm_cfg.get("phase_bit_depth"),
+        source_config=source_cfg,
+    )
+
+    phase_cfg = dict(optical_cfg["phase_layer"])
+    optical_layers = []
+    for _ in range(num_levels):
+        phase_grid_height = slm.sy if phase_cfg.get("phase_grid_height") is None else int(phase_cfg["phase_grid_height"])
+        phase_grid_width = slm.sx if phase_cfg.get("phase_grid_width") is None else int(phase_cfg["phase_grid_width"])
+        optical_layers.append(
+            DiffractivePhaseLayer(
+                width_m=slm.width,
+                height_m=slm.height,
+                dx_m=slm.dx,
+                channels=len(source_cfg.wavelengths_m),
+                wavelengths_m=source_cfg.wavelengths_m,
+                alpha_pi=float(phase_cfg.get("alpha_pi", 2.0)),
+                share_across_channels=bool(phase_cfg.get("share_across_channels", True)),
+                reference_wavelength_m=phase_cfg.get("reference_wavelength_m"),
+                phase_grid_height=phase_grid_height,
+                phase_grid_width=phase_grid_width,
+                initial_phase_map_rad=_build_initial_phase_map(
+                    phase_cfg=phase_cfg,
+                    source_cfg=source_cfg,
+                    phase_grid_height=phase_grid_height,
+                    phase_grid_width=phase_grid_width,
+                ),
+            )
+        )
+
+    detector_cfg = DetectorConfig(
+        width_num=int(optical_cfg["detector"]["width_num"]),
+        height_num=int(optical_cfg["detector"]["height_num"]),
+        detector_unit_len_m=float(optical_cfg["detector"]["detector_unit_len_m"]),
+    )
+    detector = DetectorLayer(config=detector_cfg, dx_m=slm.dx)
+
+    propagation_cfg = PropagationConfig(
+        canvas_h=optical_cfg["propagation"].get("canvas_h"),
+        canvas_w=optical_cfg["propagation"].get("canvas_w"),
+        canvas_factor=float(optical_cfg["propagation"].get("canvas_factor", 1.0)),
+        refractive_index=float(optical_cfg["propagation"].get("refractive_index", 1.0)),
+        use_bandlimit_window=bool(optical_cfg["propagation"].get("use_bandlimit_window", False)),
+        evanescent_mode=str(optical_cfg["propagation"].get("evanescent_mode", "keep")),
+        fft_norm=str(optical_cfg["propagation"].get("fft_norm", "ortho")),
+    )
+    error_cfg = PropagationErrorConfig(
+        delta_z_m=float(optical_cfg["error"].get("delta_z_m", 0.0)),
+        shift_x_m=float(optical_cfg["error"].get("shift_x_m", 0.0)),
+        shift_y_m=float(optical_cfg["error"].get("shift_y_m", 0.0)),
+    )
+
+    decoder = OpticalPrefixReadoutDecoder(
+        slm_layer=slm,
+        optical_layers=tuple(optical_layers),
+        detector_layer=detector,
+        distance_slm_to_first_layer_m=float(optical_cfg["distances_m"]["slm_to_first_layer_m"]),
+        distance_between_layers_m=_expand_between_layer_distances(
+            optical_cfg["distances_m"]["between_layers_m"],
+            num_levels=num_levels,
+        ),
+        distance_last_layer_to_detector_m=float(optical_cfg["distances_m"]["last_layer_to_detector_m"]),
+        propagation_config=propagation_cfg,
+        error_config=error_cfg,
+        default_error_factor=float(optical_cfg["error"].get("error_factor", 1.0)),
+    )
+
+    encoder = ConditionalPhaseSLMEncoder(
+        input_channels=int(encoder_cfg.get("noise_channels", 1)),
+        input_height=int(encoder_cfg.get("input_height", sample_target.shape[-2])),
+        input_width=int(encoder_cfg.get("input_width", sample_target.shape[-1])),
+        output_height=int(encoder_cfg.get("output_height", slm.pixel_count_y)),
+        output_width=int(encoder_cfg.get("output_width", slm.pixel_count_x)),
+        hidden_dim=int(encoder_cfg.get("hidden_dim", 512)),
+        phase_alpha_pi=float(encoder_cfg.get("phase_alpha_pi", 2.0)),
+        time_conditional=bool(encoder_cfg.get("time_conditional", False)),
+        time_embedding_type=str(encoder_cfg.get("time_embedding_type", "positional")),
+        time_embedding_dim=int(encoder_cfg.get("time_embedding_dim", 128)),
+        class_conditional=bool(encoder_cfg.get("class_conditional", False)),
+        condition_mode=encoder_cfg.get("condition_mode"),
+        num_classes=int(encoder_cfg.get("num_classes", 0)),
+        condition_input_dim=encoder_cfg.get("condition_input_dim"),
+        class_embed_dim=int(encoder_cfg.get("class_embed_dim", 128)),
+        class_condition_channels=int(encoder_cfg.get("class_condition_channels", 4)),
+        condition_hidden_dim=encoder_cfg.get("condition_hidden_dim"),
+        weight_init=str(encoder_cfg.get("weight_init", "kaiming_uniform")),
+        output_weight_init=str(encoder_cfg.get("output_weight_init", "xavier_uniform")),
+        embedding_init_std=float(encoder_cfg.get("embedding_init_std", 0.02)),
+    )
+    return OpticalMultiscaleModel(
+        encoder=encoder,
+        optical_decoder=decoder,
+        upsample_mode=str(encoder_cfg.get("upsample_mode", "nearest")),
+    )
+
+
+def _build_loss(
+    config: dict[str, Any],
+    *,
+    multiscale_transform: MultiScaleFrequencyTargetTransform,
+) -> OpticalMultiscaleLoss:
+    loss_cfg = dict(config["loss"])
+    num_levels = int(config["multiscale"]["num_levels"])
+    band_mode = str(loss_cfg.get("band_mode", "prefix_difference"))
+    band_transform = multiscale_transform if band_mode == "frequency_transform" else None
+    return OpticalMultiscaleLoss(
+        num_levels=num_levels,
+        final_weight=float(loss_cfg.get("final_weight", 1.0)),
+        scale_weight=float(loss_cfg.get("scale_weight", 1.0)),
+        band_weight=float(loss_cfg.get("band_weight", 0.0)),
+        tv_weight=float(loss_cfg.get("tv_weight", 0.0)),
+        background_weight=float(loss_cfg.get("background_weight", 0.0)),
+        background_threshold=float(loss_cfg.get("background_threshold", 0.05)),
+        loss_type=str(loss_cfg.get("loss_type", "mse")),
+        band_mode=band_mode,
+        level_weights=loss_cfg.get("level_weights"),
+        band_transform=band_transform,
+    )
+
+
+def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            output[key] = value.to(device)
+        elif isinstance(value, tuple):
+            output[key] = tuple(item.to(device) if isinstance(item, torch.Tensor) else item for item in value)
+        else:
+            output[key] = value
+    return output
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _resolve_sample_ids(batch: dict[str, Any], *, batch_size: int) -> torch.Tensor:
+    if "sample_id" not in batch:
+        raise KeyError("dataset batch must contain 'sample_id' for fixed latent generation")
+    sample_ids = batch["sample_id"]
+    if not isinstance(sample_ids, torch.Tensor):
+        sample_ids = torch.as_tensor(sample_ids, dtype=torch.long)
+    sample_ids = sample_ids.to(dtype=torch.long).reshape(-1)
+    if int(sample_ids.shape[0]) != batch_size:
+        raise ValueError(
+            f"sample_id batch size must match target batch size {batch_size}, got {int(sample_ids.shape[0])}"
+        )
+    return sample_ids
+
+
+def _build_fixed_latent_batch(
+    sample_ids: torch.Tensor,
+    *,
+    latent_seed: int,
+    encoder: ConditionalPhaseSLMEncoder,
+    device: torch.device,
+) -> torch.Tensor:
+    latent_shape = (encoder.input_channels, encoder.input_height, encoder.input_width)
+    latents: list[torch.Tensor] = []
+    for sample_id in sample_ids.tolist():
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(latent_seed) + int(sample_id))
+        latents.append(torch.randn(latent_shape, generator=generator, dtype=torch.float32))
+    return torch.stack(latents, dim=0).to(device=device)
+
+
+def _resolve_condition_batch(
+    batch: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    device: torch.device,
+) -> torch.Tensor | None:
+    encoder_cfg = dict(config["encoder"])
+    condition_mode = encoder_cfg.get("condition_mode")
+    if condition_mode is None and not bool(encoder_cfg.get("class_conditional", False)):
+        return None
+    if "label" not in batch:
+        raise KeyError("dataset batch must contain 'label' when conditioning is enabled")
+    if condition_mode == "attribute_vector":
+        return batch["label"].to(device=device, dtype=torch.float32)
+    return batch["label"].to(device=device, dtype=torch.long).reshape(-1)
+
+
+def _build_model_inputs(
+    batch: dict[str, Any],
+    *,
+    model: OpticalMultiscaleModel,
+    config: dict[str, Any],
+    device: torch.device,
+    latent_seed_override: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    encoder = model.encoder
+    if not isinstance(encoder, ConditionalPhaseSLMEncoder):
+        raise TypeError(
+            "train_optical_multiscale currently expects model.encoder to be ConditionalPhaseSLMEncoder, "
+            f"got {type(encoder).__name__}"
+        )
+
+    if "latent" in batch:
+        latent = batch["latent"].to(device=device, dtype=torch.float32)
+        if latent.dim() != 4:
+            raise ValueError(f"dataset latent must be [B,C,H,W], got {tuple(latent.shape)}")
+        expected_shape = (encoder.input_channels, encoder.input_height, encoder.input_width)
+        if tuple(latent.shape[1:]) != expected_shape:
+            raise ValueError(
+                f"dataset latent shape must match encoder input shape {expected_shape}, got {tuple(latent.shape[1:])}"
+            )
+        return latent, _resolve_condition_batch(batch, config=config, device=device)
+
+    batch_size = int(batch["target_final"].shape[0])
+    sample_ids = _resolve_sample_ids(batch, batch_size=batch_size)
+    encoder_cfg = dict(config["encoder"])
+    latent_seed = int(
+        encoder_cfg.get(
+            "latent_seed",
+            0 if latent_seed_override is None else int(latent_seed_override),
+        )
+    )
+    if latent_seed_override is not None:
+        latent_seed = int(latent_seed_override)
+    noise = _build_fixed_latent_batch(
+        sample_ids,
+        latent_seed=latent_seed,
+        encoder=encoder,
+        device=device,
+    )
+    return noise, _resolve_condition_batch(batch, config=config, device=device)
+
+
+def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
+    repo_root = Path(__file__).resolve().parents[2]
+    config_dir = config_path.resolve().parent
+    runtime_cfg = dict(config.get("runtime", {}))
+    train_cfg = dict(config["training"])
+
+    seed = int(runtime_cfg.get("seed", 42))
+    _seed_everything(seed)
+
+    device = torch.device(str(runtime_cfg.get("device", "cpu")))
+    dataset, loader, multiscale_transform = _build_dataset_and_loader(
+        config,
+        config_dir=config_dir,
+        repo_root=repo_root,
+    )
+    sample_target = dataset[0]["target_final"]
+    model = _build_model(config, sample_target=sample_target).to(device)
+    criterion = _build_loss(config, multiscale_transform=multiscale_transform)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=float(train_cfg.get("lr", 1.0e-3)),
+        weight_decay=float(train_cfg.get("weight_decay", 0.0)),
+    )
+
+    output_dir = _resolve_path(str(train_cfg["output_dir"]), config_dir=config_dir, repo_root=repo_root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    history_path = output_dir / "history.jsonl"
+    config_copy_path = output_dir / "resolved_config.json"
+    config_copy_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    max_epochs = int(train_cfg.get("epochs", 1))
+    max_steps_per_epoch = train_cfg.get("max_steps_per_epoch")
+    log_interval = int(train_cfg.get("log_interval", 10))
+    latest_metrics: dict[str, Any] = {}
+
+    for epoch_idx in range(max_epochs):
+        model.train()
+        running_total = 0.0
+        running_final = 0.0
+        running_scale = 0.0
+        running_band = 0.0
+        running_tv = 0.0
+        running_background = 0.0
+        step_count = 0
+
+        for step_idx, batch in enumerate(loader, start=1):
+            batch = _move_batch_to_device(batch, device)
+            model_input, class_labels = _build_model_inputs(
+                batch,
+                model=model,
+                config=config,
+                device=device,
+            )
+            model_output = model(model_input, class_labels=class_labels)
+            loss_output = criterion(model_output, batch)
+            total_loss = loss_output["total_loss"]
+
+            optimizer.zero_grad(set_to_none=True)
+            total_loss.backward()
+            optimizer.step()
+
+            running_total += float(total_loss.detach().cpu())
+            running_final += float(loss_output["final_loss"].detach().cpu())
+            running_scale += float(loss_output["scale_loss"].detach().cpu())
+            running_band += float(loss_output["band_loss"].detach().cpu())
+            running_tv += float(loss_output["tv_loss"].detach().cpu())
+            running_background += float(loss_output["background_loss"].detach().cpu())
+            step_count += 1
+
+            if step_idx % log_interval == 0:
+                print(
+                    f"[epoch {epoch_idx + 1}/{max_epochs}] "
+                    f"step={step_idx} total={running_total / step_count:.6f} "
+                    f"final={running_final / step_count:.6f} "
+                    f"scale={running_scale / step_count:.6f} "
+                    f"band={running_band / step_count:.6f} "
+                    f"tv={running_tv / step_count:.6f} "
+                    f"bg={running_background / step_count:.6f}"
+                )
+
+            if max_steps_per_epoch is not None and step_idx >= int(max_steps_per_epoch):
+                break
+
+        if step_count == 0:
+            raise RuntimeError("Training dataloader produced zero steps")
+
+        latest_metrics = {
+            "epoch": epoch_idx + 1,
+            "total_loss": running_total / step_count,
+            "final_loss": running_final / step_count,
+            "scale_loss": running_scale / step_count,
+            "band_loss": running_band / step_count,
+            "tv_loss": running_tv / step_count,
+            "background_loss": running_background / step_count,
+        }
+        print(
+            f"[epoch {epoch_idx + 1}/{max_epochs}] "
+            f"total={latest_metrics['total_loss']:.6f} "
+            f"final={latest_metrics['final_loss']:.6f} "
+            f"scale={latest_metrics['scale_loss']:.6f} "
+            f"band={latest_metrics['band_loss']:.6f} "
+            f"tv={latest_metrics['tv_loss']:.6f} "
+            f"bg={latest_metrics['background_loss']:.6f}"
+        )
+        _append_jsonl(history_path, latest_metrics)
+
+        checkpoint = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "metrics": latest_metrics,
+            "config": config,
+        }
+        torch.save(checkpoint, output_dir / "latest.pt")
+        if bool(train_cfg.get("save_every_epoch", False)):
+            torch.save(checkpoint, output_dir / f"epoch_{epoch_idx + 1:03d}.pt")
+
+    return {
+        "output_dir": str(output_dir),
+        "latest_checkpoint": str(output_dir / "latest.pt"),
+        "history_path": str(history_path),
+        "metrics": latest_metrics,
+    }
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train the multiscale optical model from a config file.")
+    parser.add_argument("--config", type=Path, required=True, help="Path to JSON/YAML config file.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    config_path = args.config.resolve()
+    config = _load_config(config_path)
+    result = train(config, config_path=config_path)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

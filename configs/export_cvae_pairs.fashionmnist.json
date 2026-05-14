@@ -1,0 +1,17 @@
+{
+  "runtime": {
+    "device": "cuda"
+  },
+  "checkpoint_path": "outputs/train_cvae/fashionmnist_example/latest.pt",
+  "dataset": {
+    "manifest_path": "dataset/fashionmnist/fashionmnist.json",
+    "channel_mode": "mean",
+    "batch_size": 128,
+    "num_workers": 0,
+    "max_items": null
+  },
+  "export": {
+    "latent_mode": "posterior_mean",
+    "output_manifest_path": "dataset/fashionmnist_cvae_pairs/fashionmnist_cvae_pairs.json"
+  }
+}

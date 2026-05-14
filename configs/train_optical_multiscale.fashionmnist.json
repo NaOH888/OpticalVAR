@@ -1,0 +1,116 @@
+{
+  "runtime": {
+    "seed": 42,
+    "device": "cuda"
+  },
+  "dataset": {
+    "manifest_path": "dataset/fashionmnist_cvae_pairs/fashionmnist_cvae_pairs.json",
+    "channel_mode": "first",
+    "batch_size": 64,
+    "shuffle": true,
+    "num_workers": 0,
+    "drop_last": false,
+    "max_items": 128
+  },
+  "multiscale": {
+    "num_levels": 3,
+    "max_freq_fraction": 1.0,
+    "transition_width": 0.05
+  },
+  "encoder": {
+    "noise_channels": 1,
+    "latent_seed": 20260514,
+    "hidden_dim": 256,
+    "input_height": 4,
+    "input_width": 4,
+    "output_height": 256,
+    "output_width": 256,
+    "phase_alpha_pi": 2.0,
+    "time_conditional": false,
+    "time_embedding_type": "positional",
+    "time_embedding_dim": 128,
+    "class_conditional": true,
+    "num_classes": 10,
+    "class_embed_dim": 128,
+    "class_condition_channels": 4,
+    "upsample_mode": "nearest",
+    "weight_init": "kaiming_uniform",
+    "output_weight_init": "xavier_uniform",
+    "embedding_init_std": 0.02
+  },
+  "optical": {
+    "source": {
+      "wavelengths_m": [
+        5.32e-7
+      ],
+      "light_mode": "phase",
+      "amplitude": 1.0
+    },
+    "slm": {
+      "pixel_pitch_x_m": 1.0e-6,
+      "pixel_pitch_y_m": 1.0e-6,
+      "pixel_count_x": 256,
+      "pixel_count_y": 256,
+      "dx_m": 1e-6,
+      "fill_factor": 1.0,
+      "phase_alpha": 2.0,
+      "phase_bit_depth": null
+    },
+    "phase_layer": {
+      "alpha_pi": 2.0,
+      "share_across_channels": true,
+      "reference_wavelength_m": null,
+      "phase_grid_height": 256,
+      "phase_grid_width": 256,
+      "initial_phase_value_rad": 1.0
+    },
+    "detector": {
+      "width_num": 32,
+      "height_num": 32,
+      "detector_unit_len_m": 8.0e-6,
+      "init_mode": "uniform",
+      "init_min_rad": 0.0,
+      "init_max_rad": 6.283185307179586
+    },
+    "propagation": {
+      "canvas_h": null,
+      "canvas_w": null,
+      "canvas_factor": 2.0,
+      "refractive_index": 1.0,
+      "use_bandlimit_window": false,
+      "evanescent_mode": "keep",
+      "fft_norm": "ortho"
+    },
+    "error": {
+      "delta_z_m": 0.0,
+      "shift_x_m": 0.0,
+      "shift_y_m": 0.0,
+      "error_factor": 0.0
+    },
+    "distances_m": {
+      "slm_to_first_layer_m": 1.0e-3,
+      "between_layers_m": 1.0e-3,
+      "last_layer_to_detector_m": 1.0e-3
+    }
+  },
+  "loss": {
+    "final_weight": 1.0,
+    "scale_weight": 2.0,
+    "band_weight": 0.5,
+    "tv_weight": 0.01,
+    "background_weight": 0.02,
+    "background_threshold": 0.05,
+    "loss_type": "mse",
+    "band_mode": "prefix_difference",
+    "level_weights": [2.0, 1.0, 0.5]
+  },
+  "training": {
+    "epochs": 200,
+    "lr": 0.002,
+    "weight_decay": 0.0,
+    "log_interval": 10,
+    "max_steps_per_epoch": 10,
+    "save_every_epoch": false,
+    "output_dir": "outputs/train_optical_multiscale/fashionmnist_example"
+  }
+}

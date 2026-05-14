@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+import bisect
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+
+class NpzImageDataset(Dataset):
+    """Load image/label pairs from an offline NPZ archive."""
+
+    def __init__(
+        self,
+        npz_path: str | Path | list[str] | list[Path] | tuple[str | Path, ...],
+        *,
+        image_key: str = "images",
+        label_key: str | None = "labels",
+        latent_key: str | None = None,
+        sample_id_key: str | None = None,
+        max_items: int | None = None,
+        dtype: torch.dtype = torch.float32,
+        channel_mode: str = "keep",
+    ) -> None:
+        raw_paths = npz_path if isinstance(npz_path, (list, tuple)) else [npz_path]
+        self.npz_paths = [Path(path) for path in raw_paths]
+        if not self.npz_paths:
+            raise ValueError("npz_path must contain at least one NPZ path")
+        for path in self.npz_paths:
+            if not path.exists():
+                raise FileNotFoundError(f"NPZ dataset not found: {path}")
+
+        self.image_key = str(image_key)
+        self.label_key = None if label_key is None else str(label_key)
+        self.latent_key = None if latent_key is None else str(latent_key)
+        self.sample_id_key = None if sample_id_key is None else str(sample_id_key)
+        self.dtype = dtype
+        self.channel_mode = str(channel_mode)
+        if self.channel_mode not in {"keep", "first", "mean"}:
+            raise ValueError(
+                "channel_mode must be one of {'keep', 'first', 'mean'}, "
+                f"got {self.channel_mode!r}"
+            )
+
+        self.archives: list[np.lib.npyio.NpzFile] | None = None
+        self.images: list[np.ndarray] | None = None
+        self.labels: list[np.ndarray] | None = None
+        self.latents: list[np.ndarray] | None = None
+        self.sample_ids: list[np.ndarray] | None = None
+        self.shard_lengths: list[int] = []
+        self.cumulative_lengths: list[int] = []
+
+        self._open_archives()
+        if self.images is None:
+            raise RuntimeError("failed to initialize NPZ dataset archives")
+        total_items = 0
+        for image_array in self.images:
+            shard_length = int(image_array.shape[0])
+            total_items += shard_length
+            self.shard_lengths.append(shard_length)
+            self.cumulative_lengths.append(total_items)
+
+        if max_items is None:
+            self.length = total_items
+        else:
+            self.length = min(int(max_items), total_items)
+
+    def _open_archives(self) -> None:
+        if self.archives is not None:
+            return
+        archives = [np.load(path, allow_pickle=False) for path in self.npz_paths]
+        images: list[np.ndarray] = []
+        labels: list[np.ndarray] | None = [] if self.label_key is not None else None
+        latents: list[np.ndarray] | None = [] if self.latent_key is not None else None
+        sample_ids: list[np.ndarray] | None = [] if self.sample_id_key is not None else None
+        for archive, path in zip(archives, self.npz_paths):
+            if self.image_key not in archive.files:
+                raise KeyError(
+                    f"image_key={self.image_key!r} is not present in {path.name}: {sorted(archive.files)}"
+                )
+            images.append(archive[self.image_key])
+            if labels is not None:
+                if self.label_key not in archive.files:
+                    raise KeyError(
+                        f"label_key={self.label_key!r} is not present in {path.name}: {sorted(archive.files)}"
+                    )
+                labels.append(archive[self.label_key])
+            if latents is not None:
+                if self.latent_key not in archive.files:
+                    raise KeyError(
+                        f"latent_key={self.latent_key!r} is not present in {path.name}: {sorted(archive.files)}"
+                    )
+                latents.append(archive[self.latent_key])
+            if sample_ids is not None:
+                if self.sample_id_key not in archive.files:
+                    raise KeyError(
+                        f"sample_id_key={self.sample_id_key!r} is not present in {path.name}: {sorted(archive.files)}"
+                    )
+                sample_ids.append(archive[self.sample_id_key])
+        self.archives = archives
+        self.images = images
+        self.labels = labels
+        self.latents = latents
+        self.sample_ids = sample_ids
+
+    def close(self) -> None:
+        if self.archives is not None:
+            for archive in self.archives:
+                archive.close()
+        self.archives = None
+        self.images = None
+        self.labels = None if self.label_key is None else []
+        self.latents = None if self.latent_key is None else []
+        self.sample_ids = None if self.sample_id_key is None else []
+
+    def __getstate__(self) -> dict:
+        state = dict(self.__dict__)
+        archives = state.get("archives")
+        if archives is not None:
+            for archive in archives:
+                archive.close()
+        state["archives"] = None
+        state["images"] = None
+        state["labels"] = None if self.label_key is None else []
+        state["latents"] = None if self.latent_key is None else []
+        state["sample_ids"] = None if self.sample_id_key is None else []
+        return state
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @classmethod
+    def from_manifest(
+        cls,
+        manifest_path: str | Path,
+        *,
+        max_items: int | None = None,
+        dtype: torch.dtype = torch.float32,
+        channel_mode: str = "keep",
+    ) -> "NpzImageDataset":
+        manifest_file = Path(manifest_path)
+        payload = json.loads(manifest_file.read_text(encoding="utf-8"))
+        if "npz_files" in payload:
+            npz_path = [manifest_file.parent / str(filename) for filename in payload["npz_files"]]
+        else:
+            npz_path = manifest_file.parent / manifest_file.name.replace(".json", ".npz")
+        if "image_key" in payload:
+            image_key = str(payload["image_key"])
+        else:
+            image_key = str(payload.get("config", {}).get("image_key", "images"))
+        label_key = payload.get("label_key", payload.get("config", {}).get("label_key", "labels"))
+        latent_key = payload.get("latent_key", payload.get("config", {}).get("latent_key"))
+        sample_id_key = payload.get("sample_id_key", payload.get("config", {}).get("sample_id_key"))
+        return cls(
+            npz_path=npz_path,
+            image_key=image_key,
+            label_key=None if label_key is None else str(label_key),
+            latent_key=None if latent_key is None else str(latent_key),
+            sample_id_key=None if sample_id_key is None else str(sample_id_key),
+            max_items=max_items,
+            dtype=dtype,
+            channel_mode=channel_mode,
+        )
+
+    def __len__(self) -> int:
+        return self.length
+
+    def _resolve_location(self, index: int) -> tuple[int, int]:
+        if index < 0 or index >= self.length:
+            raise IndexError(f"index out of range: {index}")
+        shard_index = bisect.bisect_right(self.cumulative_lengths, index)
+        shard_start = 0 if shard_index == 0 else self.cumulative_lengths[shard_index - 1]
+        local_index = index - shard_start
+        return shard_index, local_index
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        self._open_archives()
+        if self.images is None:
+            raise RuntimeError("dataset archives are not available")
+        shard_index, local_index = self._resolve_location(index)
+        image = torch.as_tensor(self.images[shard_index][local_index], dtype=self.dtype)
+        if image.dim() == 3 and self.channel_mode == "first":
+            image = image[:1]
+        elif image.dim() == 3 and self.channel_mode == "mean":
+            image = image.mean(dim=0, keepdim=True)
+        if self.sample_ids is not None and len(self.sample_ids) > 0:
+            sample_id_value = self.sample_ids[shard_index][local_index]
+        else:
+            sample_id_value = index
+        sample: dict[str, torch.Tensor] = {
+            "image": image,
+            "sample_id": torch.as_tensor(sample_id_value, dtype=torch.long),
+        }
+        if self.labels is not None and len(self.labels) > 0:
+            label_value = self.labels[shard_index][local_index]
+            if np.ndim(label_value) == 0:
+                sample["label"] = torch.as_tensor(label_value, dtype=torch.long)
+            else:
+                sample["label"] = torch.as_tensor(label_value, dtype=self.dtype)
+        if self.latents is not None and len(self.latents) > 0:
+            sample["latent"] = torch.as_tensor(self.latents[shard_index][local_index], dtype=self.dtype)
+        return sample

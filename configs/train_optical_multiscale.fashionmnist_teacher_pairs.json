@@ -1,0 +1,110 @@
+{
+  "runtime": {
+    "seed": 42,
+    "device": "cpu"
+  },
+  "dataset": {
+    "manifest_path": "dataset/fashionmnist_cvae_pairs/fashionmnist_cvae_pairs.json",
+    "channel_mode": "keep",
+    "batch_size": 8,
+    "shuffle": true,
+    "num_workers": 0,
+    "drop_last": false,
+    "max_items": null
+  },
+  "multiscale": {
+    "num_levels": 3,
+    "max_freq_fraction": 1.0,
+    "transition_width": 0.05
+  },
+  "encoder": {
+    "noise_channels": 1,
+    "input_height": 4,
+    "input_width": 4,
+    "output_height": 32,
+    "output_width": 32,
+    "hidden_dim": 512,
+    "phase_alpha_pi": 2.0,
+    "time_conditional": false,
+    "time_embedding_type": "positional",
+    "time_embedding_dim": 128,
+    "class_conditional": true,
+    "num_classes": 10,
+    "class_embed_dim": 128,
+    "class_condition_channels": 4,
+    "weight_init": "kaiming_uniform",
+    "output_weight_init": "xavier_uniform",
+    "embedding_init_std": 0.02,
+    "upsample_mode": "nearest"
+  },
+  "optical": {
+    "source": {
+      "wavelengths_m": [5.32e-7],
+      "light_mode": "phase",
+      "amplitude": 1.0
+    },
+    "slm": {
+      "pixel_pitch_x_m": 8.0e-6,
+      "pixel_pitch_y_m": 8.0e-6,
+      "pixel_count_x": 32,
+      "pixel_count_y": 32,
+      "dx_m": 1.0e-6,
+      "fill_factor": 1.0,
+      "phase_alpha": 2.0,
+      "phase_bit_depth": null
+    },
+    "phase_layer": {
+      "alpha_pi": 2.0,
+      "share_across_channels": true,
+      "init_mode": "uniform",
+      "initial_phase_value_rad": 0.0,
+      "init_min_rad": 0.0,
+      "init_max_rad": 6.283185307179586,
+      "reference_wavelength_m": 5.32e-7,
+      "phase_grid_height": 32,
+      "phase_grid_width": 32
+    },
+    "detector": {
+      "width_num": 32,
+      "height_num": 32,
+      "detector_unit_len_m": 8.0e-6
+    },
+    "propagation": {
+      "canvas_h": null,
+      "canvas_w": null,
+      "canvas_factor": 2.0,
+      "refractive_index": 1.0,
+      "use_bandlimit_window": false,
+      "evanescent_mode": "keep",
+      "fft_norm": "ortho"
+    },
+    "error": {
+      "delta_z_m": 0.0,
+      "shift_x_m": 0.0,
+      "shift_y_m": 0.0,
+      "error_factor": 1.0
+    },
+    "distances_m": {
+      "slm_to_first_layer_m": 1.0e-4,
+      "between_layers_m": [1.0e-4, 1.0e-4],
+      "last_layer_to_detector_m": 1.0e-4
+    }
+  },
+  "loss": {
+    "final_weight": 1.0,
+    "scale_weight": 1.0,
+    "band_weight": 0.5,
+    "loss_type": "mse",
+    "band_mode": "prefix_difference",
+    "level_weights": [1.0, 1.0, 1.0]
+  },
+  "training": {
+    "epochs": 10,
+    "lr": 0.001,
+    "weight_decay": 0.0,
+    "log_interval": 10,
+    "max_steps_per_epoch": null,
+    "save_every_epoch": false,
+    "output_dir": "outputs/train_optical_multiscale/fashionmnist_teacher_pairs"
+  }
+}
