@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import VGG16_Weights, vgg16
 
 from conditioning import ConditionEmbeddingLayer
 from pythae.models import VAE, VAEConfig
@@ -115,7 +117,97 @@ class ConditionalDecoder(BaseDecoder):
         return ModelOutput(reconstruction=self.decoder(hidden))
 
 
+class PerceptualLoss(nn.Module):
+    def __init__(self, *, feature_layers: tuple[int, ...], weights: str | None = "imagenet") -> None:
+        super().__init__()
+        resolved_weights: VGG16_Weights | None
+        if weights is None or str(weights).lower() == "none":
+            resolved_weights = None
+        elif str(weights).lower() == "imagenet":
+            resolved_weights = VGG16_Weights.IMAGENET1K_V1
+        else:
+            resolved_weights = None
+
+        try:
+            features = vgg16(weights=resolved_weights).features
+        except Exception as exc:
+            raise RuntimeError(
+                "failed to initialize perceptual backbone; use training.perceptual_weights='none' "
+                "or provide cached torchvision weights"
+            ) from exc
+
+        if weights not in {None, "none", "imagenet"} and str(weights).lower() != "imagenet":
+            state_dict = torch.load(str(weights), map_location="cpu")
+            features.load_state_dict(state_dict, strict=False)
+
+        self.features = features.eval()
+        self.feature_layers = tuple(sorted({int(v) for v in feature_layers}))
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1))
+        for parameter in self.features.parameters():
+            parameter.requires_grad_(False)
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if prediction.shape[1] == 1:
+            prediction = prediction.repeat(1, 3, 1, 1)
+        if target.shape[1] == 1:
+            target = target.repeat(1, 3, 1, 1)
+
+        prediction = (prediction - self.mean.to(device=prediction.device, dtype=prediction.dtype)) / self.std.to(
+            device=prediction.device, dtype=prediction.dtype
+        )
+        target = (target - self.mean.to(device=target.device, dtype=target.dtype)) / self.std.to(
+            device=target.device, dtype=target.dtype
+        )
+
+        loss = prediction.new_zeros(())
+        prediction_features = prediction
+        target_features = target
+        for layer_idx, layer in enumerate(self.features):
+            prediction_features = layer(prediction_features)
+            target_features = layer(target_features)
+            if layer_idx in self.feature_layers:
+                loss = loss + F.l1_loss(prediction_features, target_features, reduction="mean")
+        return loss
+
+
 class ConditionalVAE(VAE):
+    def __init__(
+        self,
+        model_config: VAEConfig,
+        encoder: BaseEncoder | None = None,
+        decoder: BaseDecoder | None = None,
+        *,
+        reconstruction_mode: str = "bce",
+    ) -> None:
+        super().__init__(model_config=model_config, encoder=encoder, decoder=decoder)
+        self.reconstruction_mode = str(reconstruction_mode)
+
+    def loss_function(self, recon_x, x, mu, log_var, z):
+        if self.reconstruction_mode == "mse":
+            recon_loss = 0.5 * F.mse_loss(
+                recon_x.reshape(x.shape[0], -1),
+                x.reshape(x.shape[0], -1),
+                reduction="none",
+            ).sum(dim=-1)
+        elif self.reconstruction_mode == "l1":
+            recon_loss = F.l1_loss(
+                recon_x.reshape(x.shape[0], -1),
+                x.reshape(x.shape[0], -1),
+                reduction="none",
+            ).sum(dim=-1)
+        elif self.reconstruction_mode == "bce":
+            recon_loss = F.binary_cross_entropy(
+                recon_x.reshape(x.shape[0], -1),
+                x.reshape(x.shape[0], -1),
+                reduction="none",
+            ).sum(dim=-1)
+        else:
+            raise ValueError(f"unsupported reconstruction_loss: {self.reconstruction_mode}")
+
+        kld = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=-1)
+        return (recon_loss + kld).mean(dim=0), recon_loss.mean(dim=0), kld.mean(dim=0)
+
     def forward(self, inputs, **kwargs) -> ModelOutput:
         x = inputs["data"]
         labels = inputs["labels"].to(device=x.device)
@@ -185,6 +277,7 @@ def build_cvae(model_cfg: dict) -> ConditionalVAE:
         condition_hidden_dim=None if condition_hidden_dim is None else int(condition_hidden_dim),
         hidden_channels=decoder_hidden,
     )
+    reconstruction_mode = str(model_cfg.get("reconstruction_loss", "bce"))
     model_config = VAEConfig(
         input_dim=(
             int(model_cfg.get("input_channels", 1)),
@@ -192,6 +285,22 @@ def build_cvae(model_cfg: dict) -> ConditionalVAE:
             int(model_cfg.get("image_size", 32)),
         ),
         latent_dim=latent_dim,
-        reconstruction_loss=str(model_cfg.get("reconstruction_loss", "bce")),
+        reconstruction_loss="mse" if reconstruction_mode == "l1" else reconstruction_mode,
     )
-    return ConditionalVAE(model_config=model_config, encoder=encoder, decoder=decoder)
+    return ConditionalVAE(
+        model_config=model_config,
+        encoder=encoder,
+        decoder=decoder,
+        reconstruction_mode=reconstruction_mode,
+    )
+
+
+def build_perceptual_loss(train_cfg: dict) -> PerceptualLoss | None:
+    perceptual_weight = float(train_cfg.get("perceptual_weight", 0.0))
+    if perceptual_weight <= 0.0:
+        return None
+    feature_layers = tuple(int(v) for v in train_cfg.get("perceptual_feature_layers", [3, 8, 15, 22]))
+    return PerceptualLoss(
+        feature_layers=feature_layers,
+        weights=train_cfg.get("perceptual_weights", "imagenet"),
+    )

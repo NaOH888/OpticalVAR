@@ -16,7 +16,7 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(SRC_ROOT))
 
 from optical.data import NpzImageDataset
-from vae import build_cvae
+from vae import build_cvae, build_perceptual_loss
 
 
 def _load_config(config_path: Path) -> dict[str, Any]:
@@ -79,12 +79,16 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
     )
 
     model = build_cvae(model_cfg).to(device)
+    perceptual_loss_fn = build_perceptual_loss(train_cfg)
+    if perceptual_loss_fn is not None:
+        perceptual_loss_fn = perceptual_loss_fn.to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=float(train_cfg["lr"]),
         weight_decay=float(train_cfg["weight_decay"]),
     )
     kl_weight = float(train_cfg["kl_weight"])
+    perceptual_weight = float(train_cfg.get("perceptual_weight", 0.0))
     output_dir = _resolve_path(str(train_cfg["output_dir"]), config_dir=config_dir, repo_root=repo_root)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "resolved_config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -96,6 +100,7 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
         running_total = 0.0
         running_recon = 0.0
         running_kl = 0.0
+        running_perceptual = 0.0
         step_count = 0
         for step_idx, batch in enumerate(loader, start=1):
             inputs = {
@@ -103,7 +108,11 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
                 "labels": _resolve_condition_batch(batch, model_cfg=model_cfg, device=device),
             }
             output = model(inputs)
-            total_loss = output.recon_loss + kl_weight * output.reg_loss
+            if perceptual_loss_fn is None:
+                perceptual_loss = torch.zeros((), device=device, dtype=output.recon_loss.dtype)
+            else:
+                perceptual_loss = perceptual_loss_fn(output.recon_x, inputs["data"])
+            total_loss = output.recon_loss + kl_weight * output.reg_loss + perceptual_weight * perceptual_loss
 
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
@@ -112,6 +121,7 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
             running_total += float(total_loss.detach().cpu())
             running_recon += float(output.recon_loss.detach().cpu())
             running_kl += float(output.reg_loss.detach().cpu())
+            running_perceptual += float(perceptual_loss.detach().cpu())
             step_count += 1
 
             if step_idx % int(train_cfg["log_interval"]) == 0:
@@ -119,7 +129,8 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
                     f"[epoch {epoch_idx + 1}/{int(train_cfg['epochs'])}] "
                     f"step={step_idx} total={running_total / step_count:.6f} "
                     f"recon={running_recon / step_count:.6f} "
-                    f"kl={running_kl / step_count:.6f}"
+                    f"kl={running_kl / step_count:.6f} "
+                    f"perc={running_perceptual / step_count:.6f}"
                 )
             if train_cfg.get("max_steps_per_epoch") is not None and step_idx >= int(train_cfg["max_steps_per_epoch"]):
                 break
@@ -129,6 +140,7 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
             "total_loss": running_total / step_count,
             "recon_loss": running_recon / step_count,
             "kl_loss": running_kl / step_count,
+            "perceptual_loss": running_perceptual / step_count,
         }
         _append_jsonl(history_path, latest_metrics)
         checkpoint = {
@@ -143,7 +155,8 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
             f"[epoch {epoch_idx + 1}/{int(train_cfg['epochs'])}] "
             f"total={latest_metrics['total_loss']:.6f} "
             f"recon={latest_metrics['recon_loss']:.6f} "
-            f"kl={latest_metrics['kl_loss']:.6f}"
+            f"kl={latest_metrics['kl_loss']:.6f} "
+            f"perc={latest_metrics['perceptual_loss']:.6f}"
         )
 
     return {
