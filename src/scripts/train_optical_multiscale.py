@@ -165,6 +165,32 @@ def _build_initial_phase_map(
     raise ValueError(f"Unsupported phase init_mode: {init_mode!r}")
 
 
+def _resolve_phase_layer_geometry(
+    *,
+    phase_cfg: dict[str, Any],
+    slm: SLMDeviceLayer,
+) -> tuple[float, float, int, int]:
+    phase_grid_height = slm.sy if phase_cfg.get("phase_grid_height") is None else int(phase_cfg["phase_grid_height"])
+    phase_grid_width = slm.sx if phase_cfg.get("phase_grid_width") is None else int(phase_cfg["phase_grid_width"])
+    if phase_grid_height <= 0 or phase_grid_width <= 0:
+        raise ValueError(
+            "phase_grid_height and phase_grid_width must be positive, "
+            f"got {(phase_grid_height, phase_grid_width)}"
+        )
+
+    phase_pitch_x_m = float(phase_cfg.get("phase_pitch_x_m", slm.pixel_pitch_x_m))
+    phase_pitch_y_m = float(phase_cfg.get("phase_pitch_y_m", slm.pixel_pitch_y_m))
+    if phase_pitch_x_m <= 0.0 or phase_pitch_y_m <= 0.0:
+        raise ValueError(
+            "phase_pitch_x_m and phase_pitch_y_m must be positive, "
+            f"got {(phase_pitch_x_m, phase_pitch_y_m)}"
+        )
+
+    width_m = phase_pitch_x_m * float(phase_grid_width)
+    height_m = phase_pitch_y_m * float(phase_grid_height)
+    return width_m, height_m, phase_grid_height, phase_grid_width
+
+
 def _build_model(
     config: dict[str, Any],
     *,
@@ -196,12 +222,14 @@ def _build_model(
     phase_cfg = dict(optical_cfg["phase_layer"])
     optical_layers = []
     for _ in range(num_levels):
-        phase_grid_height = slm.sy if phase_cfg.get("phase_grid_height") is None else int(phase_cfg["phase_grid_height"])
-        phase_grid_width = slm.sx if phase_cfg.get("phase_grid_width") is None else int(phase_cfg["phase_grid_width"])
+        width_m, height_m, phase_grid_height, phase_grid_width = _resolve_phase_layer_geometry(
+            phase_cfg=phase_cfg,
+            slm=slm,
+        )
         optical_layers.append(
             DiffractivePhaseLayer(
-                width_m=slm.width,
-                height_m=slm.height,
+                width_m=width_m,
+                height_m=height_m,
                 dx_m=slm.dx,
                 channels=len(source_cfg.wavelengths_m),
                 wavelengths_m=source_cfg.wavelengths_m,

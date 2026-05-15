@@ -187,15 +187,38 @@ class PropagateContext:
             canvas_h = int(explicit_h)
             canvas_w = int(explicit_w)
         else:
-            max_h = max((int(getattr(layer, "sy", 0)) for _, layer in self.layers), default=0)
-            max_w = max((int(getattr(layer, "sx", 0)) for _, layer in self.layers), default=0)
-            if max_h <= 0 or max_w <= 0:
-                raise ValueError("Could not infer active layer size for canvas construction")
+            source_dx = None
+            for _, layer in self.layers:
+                if isinstance(layer, SourceLayer):
+                    source_dx = float(layer.dx)
+                    break
+            if source_dx is None or source_dx <= 0.0:
+                raise ValueError("Could not resolve source-layer dx for canvas construction")
+
+            def _layer_extent_m(layer: OpticLayer, attr_name: str, grid_attr_name: str) -> float:
+                value = getattr(layer, attr_name, None)
+                if value is not None:
+                    return float(value)
+                grid_size = getattr(layer, grid_attr_name, None)
+                if grid_size is not None:
+                    return float(grid_size) * source_dx
+                return 0.0
+
+            max_height_m = max(
+                (_layer_extent_m(layer, "height", "sy") for _, layer in self.layers),
+                default=0.0,
+            )
+            max_width_m = max(
+                (_layer_extent_m(layer, "width", "sx") for _, layer in self.layers),
+                default=0.0,
+            )
+            if max_height_m <= 0.0 or max_width_m <= 0.0:
+                raise ValueError("Could not infer active layer physical size for canvas construction")
             canvas_factor = float(self.propagation_config.canvas_factor)
             if canvas_factor < 1.0:
                 raise ValueError("canvas_factor must be >= 1.0")
-            canvas_h = int(math.ceil(max_h * canvas_factor))
-            canvas_w = int(math.ceil(max_w * canvas_factor))
+            canvas_h = int(math.ceil((max_height_m / source_dx) * canvas_factor))
+            canvas_w = int(math.ceil((max_width_m / source_dx) * canvas_factor))
 
         self._canvas_shape = (max(canvas_h, 1), max(canvas_w, 1))
         self._canvas_dirty = False

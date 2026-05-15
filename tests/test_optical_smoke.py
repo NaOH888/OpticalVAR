@@ -85,6 +85,51 @@ def _default_propagation_config() -> PropagationConfig:
 
 
 class OpticalSmokeTests(unittest.TestCase):
+    def test_canvas_shape_uses_largest_physical_layer_size(self) -> None:
+        source = LightSourceLayer(
+            width_m=4e-6,
+            height_m=4e-6,
+            dx_m=1e-6,
+            config=SourceConfig(
+                wavelengths_m=(532e-9,),
+                light_mode="phase",
+                amplitude=1.0,
+            ),
+        )
+        phase = DiffractivePhaseLayer(
+            width_m=6e-6,
+            height_m=8e-6,
+            dx_m=1e-6,
+            channels=1,
+            wavelengths_m=(532e-9,),
+            initial_phase_map_rad=torch.zeros((2, 3), dtype=torch.float32),
+            phase_grid_height=2,
+            phase_grid_width=3,
+        )
+        detector = DetectorLayer(
+            config=DetectorConfig(
+                width_num=2,
+                height_num=2,
+                detector_unit_len_m=1e-6,
+            ),
+            dx_m=1e-6,
+        )
+
+        propagation = PropagateContext(
+            propagation_config=_default_propagation_config(),
+            error_config=PropagationErrorConfig(
+                delta_z_m=0.0,
+                shift_x_m=0.0,
+                shift_y_m=0.0,
+            ),
+            error_factor=1.0,
+        )
+        propagation.add_layer(source, z=0.0)
+        propagation.add_layer(phase, z=2e-6)
+        propagation.add_layer(detector, z=4e-6)
+
+        self.assertEqual(propagation._resolve_canvas_shape(), (8, 6))
+
     def test_prefix_readouts_are_measured_on_detector_plane(self) -> None:
         source = LightSourceLayer(
             width_m=4e-6,

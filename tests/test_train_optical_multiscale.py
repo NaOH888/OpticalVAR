@@ -300,5 +300,30 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             self.assertIn("target_band_2", sample)
             dataset.base_dataset.close()
 
+    def test_phase_layer_pitch_and_grid_can_be_independent_from_slm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, _, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["optical"]["phase_layer"]["phase_grid_height"] = 2
+            config["optical"]["phase_layer"]["phase_grid_width"] = 3
+            config["optical"]["phase_layer"]["phase_pitch_x_m"] = 2.0e-6
+            config["optical"]["phase_layer"]["phase_pitch_y_m"] = 3.0e-6
+
+            model = _build_model(
+                config,
+                sample_item={
+                    "target_final": torch.zeros((1, 8, 8), dtype=torch.float32),
+                },
+            )
+            phase_layer = model.optical_decoder.optical_layers[0]
+
+            self.assertEqual(int(phase_layer.phase_grid_height), 2)
+            self.assertEqual(int(phase_layer.phase_grid_width), 3)
+            self.assertAlmostEqual(float(phase_layer.width), 6.0e-6)
+            self.assertAlmostEqual(float(phase_layer.height), 6.0e-6)
+            self.assertEqual(int(phase_layer.sx), 6)
+            self.assertEqual(int(phase_layer.sy), 6)
+
 if __name__ == "__main__":
     unittest.main()
