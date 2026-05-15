@@ -54,6 +54,15 @@ def _save_panel(path: Path, image: torch.Tensor, *, cmap: str, title: str | None
     plt.close()
 
 
+def _summarize_label(label_value: torch.Tensor | None) -> int | list[float] | None:
+    if label_value is None:
+        return None
+    label_tensor = label_value.detach().cpu()
+    if label_tensor.numel() == 1:
+        return int(label_tensor.reshape(-1)[0])
+    return label_tensor.reshape(-1).tolist()
+
+
 def _validate_mode(args: argparse.Namespace) -> str:
     fixed_mode = args.sample_index is not None
     random_mode = bool(args.random_latent)
@@ -135,7 +144,7 @@ def _save_output_panels(
     slm_phase: torch.Tensor,
     prefix_readouts: tuple[torch.Tensor, ...],
     final_prediction: torch.Tensor,
-    label: int | None,
+    label: int | list[float] | None,
     target: torch.Tensor | None = None,
 ) -> None:
     if target is not None:
@@ -193,7 +202,10 @@ def _save_output_panels(
         plt.subplot(1, len(panels), idx)
         plt.imshow(tensor_to_image(tensor), cmap="gray" if "phase" not in title else "twilight")
         if title == "prediction" and label is not None:
-            plt.title(f"{title}\nlabel={label}")
+            if isinstance(label, list):
+                plt.title(f"{title}\nattr_dim={len(label)}")
+            else:
+                plt.title(f"{title}\nlabel={label}")
         else:
             plt.title(title)
         plt.axis("off")
@@ -307,7 +319,7 @@ def main(argv: list[str] | None = None) -> None:
         slm_phase = output["slm_input"]
         encoder_phase = output["encoder_output"]
         prefix_base = f"sample_{int(args.sample_index):04d}"
-        label_value = int(batch["label"][0]) if "label" in batch else None
+        label_value = _summarize_label(batch["label"][0] if "label" in batch else None)
 
         _save_output_panels(
             output_dir=args.output_dir,
