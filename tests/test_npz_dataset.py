@@ -75,6 +75,43 @@ class NpzDatasetTests(unittest.TestCase):
             self.assertTrue(torch.allclose(sample["latent"], torch.as_tensor(latents[1])))
             dataset.close()
 
+    def test_from_manifest_can_return_rvq_codes_as_integer_latent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            npz_path = tmp_path / "tiny_rvq.npz"
+            manifest_path = tmp_path / "tiny_rvq.json"
+            images = np.ones((2, 1, 4, 4), dtype=np.float32)
+            labels = np.array([2, 7], dtype=np.int64)
+            rvq_codes = np.array([[1, 5, 9], [3, 4, 8]], dtype=np.int64)
+            np.savez(npz_path, teacher_images=images, labels=labels, rvq_codes=rvq_codes)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "image_key": "teacher_images",
+                        "label_key": "labels",
+                        "latent_source": "rvq",
+                        "latent_type": "discrete_code",
+                        "latent_key": "rvq_codes",
+                        "latent_spec": {
+                            "num_stages": 3,
+                            "codebook_size": 256,
+                            "shape": [3],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            dataset = NpzImageDataset.from_manifest(manifest_path)
+            sample = dataset[1]
+
+            self.assertEqual(dataset.latent_source, "rvq")
+            self.assertEqual(dataset.latent_type, "discrete_code")
+            self.assertEqual(tuple(sample["latent"].shape), (3,))
+            self.assertEqual(sample["latent"].dtype, torch.long)
+            self.assertTrue(torch.equal(sample["latent"], torch.tensor([3, 4, 8], dtype=torch.long)))
+            dataset.close()
+
     def test_from_manifest_can_read_sharded_npz_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

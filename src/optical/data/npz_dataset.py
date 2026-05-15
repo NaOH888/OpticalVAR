@@ -19,6 +19,9 @@ class NpzImageDataset(Dataset):
         image_key: str = "images",
         label_key: str | None = "labels",
         latent_key: str | None = None,
+        latent_source: str | None = None,
+        latent_type: str | None = None,
+        latent_spec: dict | None = None,
         sample_id_key: str | None = None,
         max_items: int | None = None,
         dtype: torch.dtype = torch.float32,
@@ -35,6 +38,9 @@ class NpzImageDataset(Dataset):
         self.image_key = str(image_key)
         self.label_key = None if label_key is None else str(label_key)
         self.latent_key = None if latent_key is None else str(latent_key)
+        self.latent_source = None if latent_source is None else str(latent_source)
+        self.latent_type = None if latent_type is None else str(latent_type)
+        self.latent_spec = {} if latent_spec is None else dict(latent_spec)
         self.sample_id_key = None if sample_id_key is None else str(sample_id_key)
         self.dtype = dtype
         self.channel_mode = str(channel_mode)
@@ -42,6 +48,16 @@ class NpzImageDataset(Dataset):
             raise ValueError(
                 "channel_mode must be one of {'keep', 'first', 'mean'}, "
                 f"got {self.channel_mode!r}"
+            )
+        if self.latent_source is not None and self.latent_source not in {"cvae", "rvq"}:
+            raise ValueError(
+                "latent_source must be one of {'cvae', 'rvq'} when provided, "
+                f"got {self.latent_source!r}"
+            )
+        if self.latent_type is not None and self.latent_type not in {"continuous_map", "discrete_code"}:
+            raise ValueError(
+                "latent_type must be one of {'continuous_map', 'discrete_code'} when provided, "
+                f"got {self.latent_type!r}"
             )
 
         self.archives: list[np.lib.npyio.NpzFile] | None = None
@@ -155,12 +171,18 @@ class NpzImageDataset(Dataset):
             image_key = str(payload.get("config", {}).get("image_key", "images"))
         label_key = payload.get("label_key", payload.get("config", {}).get("label_key", "labels"))
         latent_key = payload.get("latent_key", payload.get("config", {}).get("latent_key"))
+        latent_source = payload.get("latent_source")
+        latent_type = payload.get("latent_type")
+        latent_spec = payload.get("latent_spec")
         sample_id_key = payload.get("sample_id_key", payload.get("config", {}).get("sample_id_key"))
         return cls(
             npz_path=npz_path,
             image_key=image_key,
             label_key=None if label_key is None else str(label_key),
             latent_key=None if latent_key is None else str(latent_key),
+            latent_source=None if latent_source is None else str(latent_source),
+            latent_type=None if latent_type is None else str(latent_type),
+            latent_spec=None if latent_spec is None else dict(latent_spec),
             sample_id_key=None if sample_id_key is None else str(sample_id_key),
             max_items=max_items,
             dtype=dtype,
@@ -203,5 +225,9 @@ class NpzImageDataset(Dataset):
             else:
                 sample["label"] = torch.as_tensor(label_value, dtype=self.dtype)
         if self.latents is not None and len(self.latents) > 0:
-            sample["latent"] = torch.as_tensor(self.latents[shard_index][local_index], dtype=self.dtype)
+            latent_value = self.latents[shard_index][local_index]
+            if self.latent_type == "discrete_code":
+                sample["latent"] = torch.as_tensor(latent_value, dtype=torch.long)
+            else:
+                sample["latent"] = torch.as_tensor(latent_value, dtype=self.dtype)
         return sample
