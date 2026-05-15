@@ -356,5 +356,28 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             self.assertEqual(int(phase_layer.sx), 6)
             self.assertEqual(int(phase_layer.sy), 6)
 
+    def test_training_can_apply_swing_level_weight_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, outputs_dir, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["training"]["epochs"] = 2
+            config["training"]["level_weight_schedule"] = {
+                "mode": "swing",
+                "base_weights": [2.0, 2.0],
+                "amplitude": 0.5,
+                "period_epochs": 1,
+            }
+
+            result = train(config, config_path=config_path)
+
+            history_lines = (outputs_dir / "history.jsonl").read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(history_lines), 2)
+            first_payload = json.loads(history_lines[0])
+            second_payload = json.loads(history_lines[1])
+            self.assertEqual(first_payload["level_weights"], [2.25, 1.75])
+            self.assertEqual(second_payload["level_weights"], [1.75, 2.25])
+            self.assertEqual(result["metrics"]["level_weights"], [1.75, 2.25])
+
 if __name__ == "__main__":
     unittest.main()

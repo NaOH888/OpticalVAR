@@ -168,6 +168,16 @@ class OpticalMultiscaleLossTests(unittest.TestCase):
         self.assertGreater(float(losses["background_loss"]), 0.0)
         self.assertGreater(float(losses["total_loss"]), float(losses["final_loss"]))
 
+    def test_level_weights_can_be_updated_after_construction(self) -> None:
+        criterion = OpticalMultiscaleLoss(
+            num_levels=3,
+            level_weights=(1.0, 1.0, 1.0),
+        )
+
+        criterion.set_level_weights((3.0, 2.0, 1.0))
+
+        self.assertEqual(criterion.level_weights, (3.0, 2.0, 1.0))
+
 
 if __name__ == "__main__":
     unittest.main()

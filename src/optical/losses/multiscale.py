@@ -59,12 +59,7 @@ class OpticalMultiscaleLoss(nn.Module):
         if level_weights is None:
             self.level_weights = tuple(1.0 for _ in range(self.num_levels))
         else:
-            self.level_weights = tuple(float(value) for value in level_weights)
-            if len(self.level_weights) != self.num_levels:
-                raise ValueError(
-                    f"level_weights length must equal num_levels={self.num_levels}, "
-                    f"got {len(self.level_weights)}"
-                )
+            self.level_weights = self._validate_level_weights(level_weights)
 
         if (
             self.band_weight != 0.0
@@ -72,6 +67,18 @@ class OpticalMultiscaleLoss(nn.Module):
             and self.band_transform is None
         ):
             self.band_transform = MultiScaleFrequencyTargetTransform(num_levels=self.num_levels)
+
+    def _validate_level_weights(self, level_weights: Sequence[float]) -> tuple[float, ...]:
+        weights = tuple(float(value) for value in level_weights)
+        if len(weights) != self.num_levels:
+            raise ValueError(
+                f"level_weights length must equal num_levels={self.num_levels}, "
+                f"got {len(weights)}"
+            )
+        return weights
+
+    def set_level_weights(self, level_weights: Sequence[float]) -> None:
+        self.level_weights = self._validate_level_weights(level_weights)
 
     def _base_loss(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if prediction.shape != target.shape:

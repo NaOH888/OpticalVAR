@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 from pathlib import Path
@@ -416,6 +417,70 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _resolve_level_weight_schedule(
+    config: dict[str, Any],
+    *,
+    epoch_idx: int,
+) -> tuple[float, ...] | None:
+    train_cfg = dict(config["training"])
+    schedule_cfg = train_cfg.get("level_weight_schedule")
+    if schedule_cfg is None:
+        return None
+    if not isinstance(schedule_cfg, dict):
+        raise TypeError("training.level_weight_schedule must be a mapping when provided")
+
+    mode = str(schedule_cfg.get("mode", "swing"))
+    num_levels = int(config["multiscale"]["num_levels"])
+    if mode != "swing":
+        raise ValueError(f"Unsupported level_weight_schedule mode: {mode!r}")
+
+    base_weights = tuple(float(value) for value in schedule_cfg.get("base_weights", config["loss"].get("level_weights", [1.0] * num_levels)))
+    if len(base_weights) != num_levels:
+        raise ValueError(
+            f"training.level_weight_schedule.base_weights must have length {num_levels}, got {len(base_weights)}"
+        )
+
+    positions_raw = schedule_cfg.get("positions")
+    if positions_raw is None:
+        center = (num_levels - 1) / 2.0
+        positions = tuple(center - float(index) for index in range(num_levels))
+    else:
+        positions = tuple(float(value) for value in positions_raw)
+        if len(positions) != num_levels:
+            raise ValueError(
+                f"training.level_weight_schedule.positions must have length {num_levels}, got {len(positions)}"
+            )
+
+    amplitude = float(schedule_cfg.get("amplitude", 0.0))
+    period_epochs = int(schedule_cfg.get("period_epochs", max(int(train_cfg.get("epochs", 1)) - 1, 1)))
+    if period_epochs <= 0:
+        raise ValueError("training.level_weight_schedule.period_epochs must be positive")
+
+    phase = math.pi * float(epoch_idx) / float(period_epochs)
+    offset = amplitude * math.cos(phase)
+    weights = [base_weight + offset * position for base_weight, position in zip(base_weights, positions)]
+
+    min_weights_raw = schedule_cfg.get("min_weights")
+    if min_weights_raw is not None:
+        min_weights = tuple(float(value) for value in min_weights_raw)
+        if len(min_weights) != num_levels:
+            raise ValueError(
+                f"training.level_weight_schedule.min_weights must have length {num_levels}, got {len(min_weights)}"
+            )
+        weights = [max(weight, lower) for weight, lower in zip(weights, min_weights)]
+
+    max_weights_raw = schedule_cfg.get("max_weights")
+    if max_weights_raw is not None:
+        max_weights = tuple(float(value) for value in max_weights_raw)
+        if len(max_weights) != num_levels:
+            raise ValueError(
+                f"training.level_weight_schedule.max_weights must have length {num_levels}, got {len(max_weights)}"
+            )
+        weights = [min(weight, upper) for weight, upper in zip(weights, max_weights)]
+
+    return tuple(float(value) for value in weights)
+
+
 def _resolve_resume_path(
     train_cfg: dict[str, Any],
     *,
@@ -606,6 +671,9 @@ def train(
         )
 
     for epoch_idx in range(start_epoch, max_epochs):
+        scheduled_level_weights = _resolve_level_weight_schedule(config, epoch_idx=epoch_idx)
+        if scheduled_level_weights is not None:
+            criterion.set_level_weights(scheduled_level_weights)
         model.train()
         running_total = 0.0
         running_final = 0.0
@@ -664,6 +732,7 @@ def train(
             "band_loss": running_band / step_count,
             "tv_loss": running_tv / step_count,
             "background_loss": running_background / step_count,
+            "level_weights": list(criterion.level_weights),
         }
         print(
             f"[epoch {epoch_idx + 1}/{max_epochs}] "
@@ -672,7 +741,8 @@ def train(
             f"scale={latest_metrics['scale_loss']:.6f} "
             f"band={latest_metrics['band_loss']:.6f} "
             f"tv={latest_metrics['tv_loss']:.6f} "
-            f"bg={latest_metrics['background_loss']:.6f}"
+            f"bg={latest_metrics['background_loss']:.6f} "
+            f"level_weights={latest_metrics['level_weights']}"
         )
         _append_jsonl(history_path, latest_metrics)
 
