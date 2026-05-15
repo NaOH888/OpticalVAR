@@ -416,6 +416,37 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _resolve_resume_path(
+    train_cfg: dict[str, Any],
+    *,
+    cli_resume: str | None,
+    config_dir: Path,
+    repo_root: Path,
+) -> Path | None:
+    raw_value = cli_resume if cli_resume is not None else train_cfg.get("resume_from")
+    if raw_value is None:
+        return None
+    return _resolve_path(str(raw_value), config_dir=config_dir, repo_root=repo_root)
+
+
+def _load_resume_checkpoint(
+    *,
+    model: OpticalMultiscaleModel,
+    optimizer: torch.optim.Optimizer,
+    resume_path: Path,
+    device: torch.device,
+    resume_optimizer: bool,
+    resume_strict: bool,
+) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model"], strict=resume_strict)
+    if resume_optimizer and "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    metrics = dict(checkpoint.get("metrics", {}))
+    start_epoch = int(checkpoint.get("epoch", metrics.get("epoch", 0)))
+    return start_epoch, metrics, checkpoint
+
+
 def _resolve_sample_ids(batch: dict[str, Any], *, batch_size: int) -> torch.Tensor:
     if "sample_id" not in batch:
         raise KeyError("dataset batch must contain 'sample_id' for fixed latent generation")
@@ -502,7 +533,12 @@ def _build_model_inputs(
     return noise, _resolve_condition_batch(batch, config=config, device=device)
 
 
-def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
+def train(
+    config: dict[str, Any],
+    *,
+    config_path: Path,
+    resume_path_override: Path | None = None,
+) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parents[2]
     config_dir = config_path.resolve().parent
     runtime_cfg = dict(config.get("runtime", {}))
@@ -536,8 +572,40 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
     max_steps_per_epoch = train_cfg.get("max_steps_per_epoch")
     log_interval = int(train_cfg.get("log_interval", 10))
     latest_metrics: dict[str, Any] = {}
+    start_epoch = 0
+    resumed_from: str | None = None
+    previous_metrics: dict[str, Any] | None = None
 
-    for epoch_idx in range(max_epochs):
+    resume_path = resume_path_override or _resolve_resume_path(
+        train_cfg,
+        cli_resume=None,
+        config_dir=config_dir,
+        repo_root=repo_root,
+    )
+    if resume_path is not None:
+        resume_optimizer = bool(train_cfg.get("resume_optimizer", True))
+        resume_strict = bool(train_cfg.get("resume_strict", True))
+        start_epoch, previous_metrics, _ = _load_resume_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            resume_path=resume_path,
+            device=device,
+            resume_optimizer=resume_optimizer,
+            resume_strict=resume_strict,
+        )
+        resumed_from = str(resume_path)
+        print(
+            f"[resume] path={resume_path} start_epoch={start_epoch} "
+            f"resume_optimizer={resume_optimizer} resume_strict={resume_strict}"
+        )
+        if previous_metrics:
+            print(f"[resume] previous_metrics={json.dumps(previous_metrics, ensure_ascii=False)}")
+    if start_epoch >= max_epochs:
+        raise ValueError(
+            f"training.epochs={max_epochs} must be greater than resumed epoch {start_epoch}"
+        )
+
+    for epoch_idx in range(start_epoch, max_epochs):
         model.train()
         running_total = 0.0
         running_final = 0.0
@@ -609,10 +677,12 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
         _append_jsonl(history_path, latest_metrics)
 
         checkpoint = {
+            "epoch": epoch_idx + 1,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "metrics": latest_metrics,
             "config": config,
+            "resumed_from": resumed_from,
         }
         torch.save(checkpoint, output_dir / "latest.pt")
         if bool(train_cfg.get("save_every_epoch", False)):
@@ -623,12 +693,15 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
         "latest_checkpoint": str(output_dir / "latest.pt"),
         "history_path": str(history_path),
         "metrics": latest_metrics,
+        "resumed_from": resumed_from,
+        "start_epoch": start_epoch,
     }
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the multiscale optical model from a config file.")
     parser.add_argument("--config", type=Path, required=True, help="Path to JSON/YAML config file.")
+    parser.add_argument("--resume", type=Path, default=None, help="Optional checkpoint path to resume from.")
     return parser.parse_args(argv)
 
 
@@ -636,7 +709,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     config_path = args.config.resolve()
     config = _load_config(config_path)
-    result = train(config, config_path=config_path)
+    result = train(
+        config,
+        config_path=config_path,
+        resume_path_override=None if args.resume is None else args.resume.resolve(),
+    )
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

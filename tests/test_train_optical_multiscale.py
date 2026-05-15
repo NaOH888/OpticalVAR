@@ -20,6 +20,7 @@ from scripts.train_optical_multiscale import (
     _build_model_inputs,
     _move_batch_to_device,
     main,
+    train,
 )
 
 
@@ -172,6 +173,36 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             payload = json.loads(history_lines[-1])
             self.assertIn("tv_loss", payload)
             self.assertIn("background_loss", payload)
+
+    def test_train_can_resume_with_updated_loss_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, outputs_dir, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+
+            first_result = train(config, config_path=config_path)
+            self.assertEqual(int(first_result["start_epoch"]), 0)
+            first_checkpoint_path = Path(first_result["latest_checkpoint"])
+            first_checkpoint = torch.load(first_checkpoint_path, map_location="cpu", weights_only=False)
+            self.assertEqual(int(first_checkpoint["epoch"]), 1)
+
+            config["training"]["epochs"] = 2
+            config["loss"]["scale_weight"] = 3.0
+            config["training"]["resume_optimizer"] = True
+            second_result = train(
+                config,
+                config_path=config_path,
+                resume_path_override=first_checkpoint_path,
+            )
+
+            self.assertEqual(int(second_result["start_epoch"]), 1)
+            self.assertEqual(second_result["resumed_from"], str(first_checkpoint_path))
+            resumed_checkpoint = torch.load(first_checkpoint_path, map_location="cpu", weights_only=False)
+            self.assertEqual(int(resumed_checkpoint["epoch"]), 2)
+            self.assertAlmostEqual(float(resumed_checkpoint["config"]["loss"]["scale_weight"]), 3.0)
+
+            history_lines = (outputs_dir / "history.jsonl").read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(history_lines), 2)
 
     def test_fixed_latent_depends_on_sample_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
