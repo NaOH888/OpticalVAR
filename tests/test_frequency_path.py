@@ -56,6 +56,19 @@ class FrequencyPathTests(unittest.TestCase):
             )
         )
 
+    def test_transform_accepts_explicit_cutoffs(self) -> None:
+        transform = MultiScaleFrequencyTargetTransform(
+            num_levels=3,
+            transition_width=0.05,
+            cutoffs=[0.12, 0.34],
+        )
+
+        output = transform(torch.arange(16, dtype=torch.float32).reshape(1, 4, 4) / 15.0)
+
+        self.assertEqual(transform.cutoffs, (0.12, 0.34))
+        self.assertEqual(len(output["target_scales"]), 3)
+        self.assertEqual(len(output["target_bands"]), 3)
+
     def test_dataset_wraps_tuple_dataset_and_attaches_targets(self) -> None:
         dataset = FrequencyPathDataset(
             _TupleImageDataset(),

@@ -49,6 +49,26 @@ def _resolve_path(path_value: str, *, config_dir: Path, repo_root: Path) -> Path
     return (repo_root / candidate).resolve()
 
 
+def _resolve_multiscale_cutoffs(
+    multiscale_cfg: dict[str, Any],
+    *,
+    config_dir: Path,
+    repo_root: Path,
+) -> tuple[float, ...] | None:
+    if "cutoffs" in multiscale_cfg and multiscale_cfg["cutoffs"] is not None:
+        return tuple(float(value) for value in multiscale_cfg["cutoffs"])
+    cutoffs_path_value = multiscale_cfg.get("cutoffs_path")
+    if cutoffs_path_value is None:
+        return None
+    cutoffs_path = _resolve_path(str(cutoffs_path_value), config_dir=config_dir, repo_root=repo_root)
+    payload = json.loads(cutoffs_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"multiscale cutoff file root must be a mapping, got {type(payload).__name__}")
+    if "cutoffs" not in payload:
+        raise KeyError(f"multiscale cutoff file {cutoffs_path} must contain 'cutoffs'")
+    return tuple(float(value) for value in payload["cutoffs"])
+
+
 def _seed_everything(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -82,6 +102,11 @@ def _build_dataset_and_loader(
         num_levels=int(multiscale_cfg["num_levels"]),
         max_freq_fraction=float(multiscale_cfg.get("max_freq_fraction", 1.0)),
         transition_width=float(multiscale_cfg.get("transition_width", 0.05)),
+        cutoffs=_resolve_multiscale_cutoffs(
+            multiscale_cfg,
+            config_dir=config_dir,
+            repo_root=repo_root,
+        ),
     )
     dataset = FrequencyPathDataset(
         base_dataset,

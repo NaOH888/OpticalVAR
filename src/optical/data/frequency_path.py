@@ -27,6 +27,7 @@ class MultiScaleFrequencyTargetTransform:
         num_levels: int,
         max_freq_fraction: float = 1.0,
         transition_width: float = 0.05,
+        cutoffs: Sequence[float] | None = None,
     ) -> None:
         if int(num_levels) <= 0:
             raise ValueError(f"num_levels must be positive, got {num_levels!r}")
@@ -40,6 +41,28 @@ class MultiScaleFrequencyTargetTransform:
         self.num_levels = int(num_levels)
         self.max_freq_fraction = float(max_freq_fraction)
         self.transition_width = float(transition_width)
+        self.cutoffs = self._resolve_cutoffs(cutoffs)
+
+    def _resolve_cutoffs(self, cutoffs: Sequence[float] | None) -> tuple[float, ...] | None:
+        if self.num_levels == 1:
+            if cutoffs is not None and len(tuple(cutoffs)) != 0:
+                raise ValueError("cutoffs must be empty when num_levels == 1")
+            return ()
+        if cutoffs is None:
+            return None
+        values = tuple(float(value) for value in cutoffs)
+        if len(values) != self.num_levels - 1:
+            raise ValueError(
+                f"cutoffs must have length {self.num_levels - 1}, got {len(values)}"
+            )
+        previous = 0.0
+        for value in values:
+            if not (0.0 < value <= 1.0):
+                raise ValueError(f"each cutoff must be in (0, 1], got {value!r}")
+            if value <= previous:
+                raise ValueError(f"cutoffs must be strictly increasing, got {values!r}")
+            previous = value
+        return values
 
     @staticmethod
     def _normalize_image(image: torch.Tensor) -> torch.Tensor:
@@ -69,13 +92,16 @@ class MultiScaleFrequencyTargetTransform:
         image_spectrum = torch.fft.fftshift(torch.fft.fft2(image, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
         cumulative_scales: list[torch.Tensor] = []
-        cutoffs = torch.linspace(
-            self.max_freq_fraction / float(self.num_levels),
-            self.max_freq_fraction * float(self.num_levels - 1) / float(self.num_levels),
-            steps=self.num_levels - 1,
-            device=image.device,
-            dtype=image.dtype,
-        )
+        if self.cutoffs is None:
+            cutoffs = torch.linspace(
+                self.max_freq_fraction / float(self.num_levels),
+                self.max_freq_fraction * float(self.num_levels - 1) / float(self.num_levels),
+                steps=self.num_levels - 1,
+                device=image.device,
+                dtype=image.dtype,
+            )
+        else:
+            cutoffs = torch.tensor(self.cutoffs, device=image.device, dtype=image.dtype)
         for cutoff in cutoffs:
             mask = torch.sigmoid((cutoff - radius) / self.transition_width)
             filtered = torch.fft.ifft2(

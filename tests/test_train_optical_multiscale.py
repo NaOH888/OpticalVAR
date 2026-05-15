@@ -276,5 +276,29 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             self.assertEqual(int(labels[0]), 3)
             self.assertEqual(tuple(outputs["encoder_output"].shape), (2, 1, 8, 8))
 
+    def test_dataset_builder_can_load_cutoffs_from_json_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, _, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            cutoffs_path = tmp_path / "cutoffs.json"
+            cutoffs_path.write_text(
+                json.dumps({"cutoffs": [0.12]}, indent=2),
+                encoding="utf-8",
+            )
+            config["multiscale"]["cutoffs_path"] = str(cutoffs_path)
+            config["multiscale"].pop("max_freq_fraction", None)
+            dataset, _, transform = _build_dataset_and_loader(
+                config,
+                config_dir=config_path.parent,
+                repo_root=PROJECT_ROOT,
+            )
+
+            self.assertEqual(transform.cutoffs, (0.12,))
+            sample = dataset[0]
+            self.assertIn("target_band_1", sample)
+            self.assertIn("target_band_2", sample)
+            dataset.base_dataset.close()
+
 if __name__ == "__main__":
     unittest.main()
