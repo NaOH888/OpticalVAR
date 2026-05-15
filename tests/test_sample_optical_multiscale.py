@@ -39,6 +39,8 @@ class SampleOpticalMultiscaleScriptTests(unittest.TestCase):
             self.assertTrue((sample_outputs_dir / "sample_0001_noise.png").exists())
             self.assertTrue((sample_outputs_dir / "sample_0001_target.png").exists())
             self.assertTrue((sample_outputs_dir / "sample_0001_prefix_01.png").exists())
+            self.assertTrue((sample_outputs_dir / "sample_0001_target_band_01.png").exists())
+            self.assertTrue((sample_outputs_dir / "sample_0001_prefix_band_compare_01.png").exists())
             self.assertTrue((sample_outputs_dir / "sample_0001_final_detector.png").exists())
 
     def test_sample_script_supports_random_latent_with_label(self) -> None:

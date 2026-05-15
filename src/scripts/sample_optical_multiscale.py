@@ -43,11 +43,59 @@ def tensor_to_image(x: torch.Tensor) -> torch.Tensor:
     return x / mean_power
 
 
+def tensor_to_band_image(x: torch.Tensor) -> torch.Tensor:
+    x = x.detach().cpu()
+    if torch.is_complex(x):
+        x = x.real
+    if x.dim() == 4:
+        x = x[0]
+    if x.dim() == 3:
+        if int(x.shape[0]) == 1:
+            x = x[0]
+        else:
+            x = x.mean(dim=0)
+    x = x.float()
+    max_abs = x.abs().max().clamp_min(1.0e-8)
+    return x / max_abs
+
+
 def _save_panel(path: Path, image: torch.Tensor, *, cmap: str, title: str | None = None) -> None:
     plt.figure(figsize=(5, 5))
     plt.imshow(tensor_to_image(image), cmap=cmap)
     if title is not None:
         plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+
+def _save_band_panel(path: Path, image: torch.Tensor, *, title: str | None = None) -> None:
+    plt.figure(figsize=(5, 5))
+    plt.imshow(tensor_to_band_image(image), cmap="bwr", vmin=-1.0, vmax=1.0)
+    if title is not None:
+        plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+
+def _save_prefix_band_compare_panel(
+    path: Path,
+    *,
+    prefix_readout: torch.Tensor,
+    target_band: torch.Tensor,
+    index: int,
+) -> None:
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.imshow(tensor_to_image(prefix_readout), cmap="gray")
+    plt.title(f"prefix_readout_{index}")
+    plt.axis("off")
+    plt.subplot(1, 2, 2)
+    plt.imshow(tensor_to_band_image(target_band), cmap="bwr", vmin=-1.0, vmax=1.0)
+    plt.title(f"target_band_{index}")
     plt.axis("off")
     plt.tight_layout()
     plt.savefig(path, dpi=200)
@@ -146,6 +194,7 @@ def _save_output_panels(
     final_prediction: torch.Tensor,
     label: int | list[float] | None,
     target: torch.Tensor | None = None,
+    target_bands: tuple[torch.Tensor, ...] | None = None,
 ) -> None:
     if target is not None:
         _save_panel(
@@ -179,6 +228,19 @@ def _save_output_panels(
             cmap="gray",
             title=f"prefix_readout_{index}",
         )
+        if target_bands is not None and index <= len(target_bands):
+            target_band = target_bands[index - 1]
+            _save_band_panel(
+                output_dir / f"{prefix_base}_target_band_{index:02d}.png",
+                target_band,
+                title=f"target_band_{index}",
+            )
+            _save_prefix_band_compare_panel(
+                output_dir / f"{prefix_base}_prefix_band_compare_{index:02d}.png",
+                prefix_readout=readout,
+                target_band=target_band,
+                index=index,
+            )
     _save_panel(
         output_dir / f"{prefix_base}_final_detector.png",
         final_prediction,
@@ -315,6 +377,11 @@ def main(argv: list[str] | None = None) -> None:
         prefix_readouts = output["prefix_readouts"]
         final_prediction = output["final_detector"]
         target = batch["target_final"]
+        target_bands = tuple(
+            batch[f"target_band_{index}"]
+            for index in range(1, len(prefix_readouts) + 1)
+            if f"target_band_{index}" in batch
+        )
         latent_noise = model_input
         slm_phase = output["slm_input"]
         encoder_phase = output["encoder_output"]
@@ -331,6 +398,7 @@ def main(argv: list[str] | None = None) -> None:
             final_prediction=final_prediction,
             label=label_value,
             target=target,
+            target_bands=target_bands,
         )
         summary: dict[str, Any] = {
             "mode": mode,
