@@ -82,7 +82,7 @@ def _build_fixed_mode_batch(
     sample_index: int,
     device: torch.device,
     repo_root: Path,
-) -> tuple[dict[str, Any], torch.Tensor]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     fake_config_dir = repo_root
     dataset, _, _ = _build_dataset_and_loader(
         config,
@@ -92,8 +92,7 @@ def _build_fixed_mode_batch(
     sample = dataset[int(sample_index)]
     batch = next(iter(torch.utils.data.DataLoader([sample], batch_size=1)))
     batch = _move_batch_to_device(batch, device)
-    sample_target = sample["target_final"]
-    return batch, sample_target
+    return batch, sample
 
 
 def _build_random_mode_inputs(
@@ -105,11 +104,16 @@ def _build_random_mode_inputs(
     device: torch.device,
     model: Any,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    encoder = model.encoder
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(latent_seed))
+    encoder_cfg = dict(config["encoder"])
     latent = torch.randn(
-        (int(num_samples), encoder.input_channels, encoder.input_height, encoder.input_width),
+        (
+            int(num_samples),
+            int(encoder_cfg.get("noise_channels", 1)),
+            int(encoder_cfg["input_height"]),
+            int(encoder_cfg["input_width"]),
+        ),
         generator=generator,
         dtype=torch.float32,
     ).to(device=device)
@@ -269,7 +273,7 @@ def main(argv: list[str] | None = None) -> None:
         config["dataset"]["shuffle"] = False
         config["dataset"]["num_workers"] = 0
         config["dataset"]["drop_last"] = False
-        batch, sample_target = _build_fixed_mode_batch(
+        batch, sample_item = _build_fixed_mode_batch(
             config,
             sample_index=int(args.sample_index),
             device=device,
@@ -277,9 +281,11 @@ def main(argv: list[str] | None = None) -> None:
         )
     else:
         batch = {}
-        sample_target = _make_dummy_target_from_config(config)
+        sample_item = {
+            "target_final": _make_dummy_target_from_config(config),
+        }
 
-    model = _build_model(config, sample_target=sample_target).to(device)
+    model = _build_model(config, sample_item=sample_item).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
 

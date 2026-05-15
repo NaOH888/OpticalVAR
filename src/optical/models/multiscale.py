@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
 
-from conditioning import ConditionEmbeddingLayer
+from conditioning import ConditionEmbeddingLayer, ConditionalLatentFusion, LatentEmbeddingLayer
 from optical.core import PropagateContext, PropagationConfig, PropagationErrorConfig
 from optical.core.base import OpticLayer, SourceLayer
 from optical.layers.detector import DetectorLayer
@@ -251,6 +251,133 @@ class ConditionalPhaseSLMEncoder(nn.Module):
         hidden = self.act(self.fc2(hidden))
         raw_phase = self.fc3(hidden).reshape(batch_size, 1, self.output_height, self.output_width)
         return torch.remainder(raw_phase, self.phase_period_rad)
+
+
+class PhaseMapEncoder(nn.Module):
+    """Map a fused latent representation [B, D] to an SLM phase map."""
+
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        output_height: int,
+        output_width: int,
+        hidden_dim: int = 512,
+        phase_alpha_pi: float = 2.0,
+        weight_init: str = "kaiming_uniform",
+        output_weight_init: str = "xavier_uniform",
+    ) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.output_height = int(output_height)
+        self.output_width = int(output_width)
+        self.hidden_dim = int(hidden_dim)
+        self.phase_alpha_pi = float(phase_alpha_pi)
+        self.weight_init = str(weight_init)
+        self.output_weight_init = str(output_weight_init)
+
+        if self.input_dim <= 0:
+            raise ValueError(f"input_dim must be positive, got {input_dim!r}")
+        if self.output_height <= 0 or self.output_width <= 0:
+            raise ValueError("output_height and output_width must be positive")
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be positive, got {hidden_dim!r}")
+
+        output_dim = self.output_height * self.output_width
+        self.fc1 = nn.Linear(self.input_dim, self.hidden_dim)
+        self.fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.fc3 = nn.Linear(self.hidden_dim, output_dim)
+        self.act = nn.SiLU()
+        self._reset_parameters()
+
+    @property
+    def phase_period_rad(self) -> float:
+        return float(self.phase_alpha_pi * math.pi)
+
+    def _init_linear(self, layer: nn.Linear, mode: str) -> None:
+        if mode == "kaiming_uniform":
+            init.kaiming_uniform_(layer.weight, nonlinearity="relu")
+        elif mode == "kaiming_normal":
+            init.kaiming_normal_(layer.weight, nonlinearity="relu")
+        elif mode == "xavier_uniform":
+            init.xavier_uniform_(layer.weight)
+        elif mode == "xavier_normal":
+            init.xavier_normal_(layer.weight)
+        else:
+            raise ValueError(f"Unsupported phase map encoder init mode: {mode!r}")
+        if layer.bias is not None:
+            init.zeros_(layer.bias)
+
+    def _reset_parameters(self) -> None:
+        self._init_linear(self.fc1, self.weight_init)
+        self._init_linear(self.fc2, self.weight_init)
+        self._init_linear(self.fc3, self.output_weight_init)
+
+    def forward(self, fused_repr: torch.Tensor) -> torch.Tensor:
+        if fused_repr.dim() != 2 or int(fused_repr.shape[1]) != self.input_dim:
+            raise ValueError(
+                f"fused_repr must be [B,{self.input_dim}], got {tuple(fused_repr.shape)}"
+            )
+        hidden = fused_repr.to(dtype=torch.float32)
+        hidden = self.act(self.fc1(hidden))
+        hidden = self.act(self.fc2(hidden))
+        raw_phase = self.fc3(hidden).reshape(hidden.shape[0], 1, self.output_height, self.output_width)
+        return torch.remainder(raw_phase, self.phase_period_rad)
+
+
+class LatentPhaseMapEncoder(nn.Module):
+    """latent -> latent embedding -> optional condition fusion -> phase map."""
+
+    def __init__(
+        self,
+        *,
+        latent_layer: LatentEmbeddingLayer,
+        phase_map_encoder: PhaseMapEncoder,
+        condition_layer: ConditionEmbeddingLayer | None = None,
+        fusion_layer: ConditionalLatentFusion | None = None,
+    ) -> None:
+        super().__init__()
+        self.latent_layer = latent_layer
+        self.phase_map_encoder = phase_map_encoder
+        self.condition_layer = condition_layer
+        self.fusion_layer = fusion_layer
+
+    @property
+    def output_height(self) -> int:
+        return self.phase_map_encoder.output_height
+
+    @property
+    def output_width(self) -> int:
+        return self.phase_map_encoder.output_width
+
+    @property
+    def phase_period_rad(self) -> float:
+        return self.phase_map_encoder.phase_period_rad
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        *,
+        timesteps: torch.Tensor | int | None = None,
+        class_labels: torch.Tensor | None = None,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if timesteps is not None:
+            raise ValueError("LatentPhaseMapEncoder does not support timestep conditioning")
+        latent_repr = self.latent_layer(sample)
+        if self.condition_layer is None:
+            if class_labels is not None or condition is not None:
+                raise ValueError("condition must not be provided when conditioning is disabled")
+            fused_repr = latent_repr
+        else:
+            resolved_condition = class_labels if condition is None else condition
+            if resolved_condition is None:
+                raise ValueError("condition must be provided when conditioning is enabled")
+            if self.fusion_layer is None:
+                raise RuntimeError("fusion_layer must be provided when conditioning is enabled")
+            condition_repr = self.condition_layer(resolved_condition.to(device=latent_repr.device))
+            fused_repr = self.fusion_layer(latent_repr, condition_repr)
+        return self.phase_map_encoder(fused_repr)
 
 
 class OpticalPrefixReadoutDecoder(nn.Module):

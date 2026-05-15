@@ -63,6 +63,9 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
                         "noise_channels": 1,
                         "latent_seed": 12345,
                         "hidden_dim": 32,
+                        "latent_embed_dim": 24,
+                        "condition_embed_dim": 12,
+                        "fused_dim": 20,
                         "input_height": 8,
                         "input_width": 8,
                         "output_height": 8,
@@ -186,7 +189,7 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             batch_b = next(iter(torch.utils.data.DataLoader([sample_b], batch_size=1)))
             batch_a = _move_batch_to_device(batch_a, torch.device("cpu"))
             batch_b = _move_batch_to_device(batch_b, torch.device("cpu"))
-            model = _build_model(config, sample_target=sample_a["target_final"]).to(torch.device("cpu"))
+            model = _build_model(config, sample_item=sample_a).to(torch.device("cpu"))
 
             latent_a_1, labels_a_1 = _build_model_inputs(
                 batch_a,
@@ -212,6 +215,7 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             self.assertEqual(int(labels_a_1[0]), int(batch_a["label"][0]))
             self.assertEqual(int(labels_a_2[0]), int(batch_a["label"][0]))
             self.assertEqual(int(labels_b[0]), int(batch_b["label"][0]))
+            dataset.base_dataset.close()
 
     def test_dataset_latent_overrides_fixed_latent_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -220,7 +224,10 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             config = json.loads(config_path.read_text(encoding="utf-8"))
             model = _build_model(
                 config,
-                sample_target=torch.zeros((1, 8, 8), dtype=torch.float32),
+                sample_item={
+                    "target_final": torch.zeros((1, 8, 8), dtype=torch.float32),
+                    "latent": torch.zeros((1, 8, 8), dtype=torch.float32),
+                },
             ).to(torch.device("cpu"))
             batch = {
                 "target_final": torch.zeros((2, 1, 8, 8), dtype=torch.float32),
@@ -238,6 +245,36 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             self.assertTrue(torch.allclose(latent, batch["latent"]))
             self.assertEqual(int(labels[0]), 3)
             self.assertEqual(int(labels[1]), 5)
+
+    def test_discrete_latent_codes_are_accepted_by_model_inputs_and_builder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, _, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["encoder"]["rvq_codebook_size"] = 16
+            sample_item = {
+                "target_final": torch.zeros((1, 8, 8), dtype=torch.float32),
+                "latent": torch.tensor([1, 2, 3, 4], dtype=torch.long),
+                "label": torch.tensor(3, dtype=torch.long),
+            }
+            model = _build_model(config, sample_item=sample_item).to(torch.device("cpu"))
+            batch = {
+                "target_final": torch.zeros((2, 1, 8, 8), dtype=torch.float32),
+                "latent": torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]], dtype=torch.long),
+                "label": torch.tensor([3, 5], dtype=torch.long),
+            }
+
+            latent, labels = _build_model_inputs(
+                batch,
+                model=model,
+                config=config,
+                device=torch.device("cpu"),
+            )
+            outputs = model(latent, class_labels=labels)
+
+            self.assertEqual(latent.dtype, torch.long)
+            self.assertEqual(int(labels[0]), 3)
+            self.assertEqual(tuple(outputs["encoder_output"].shape), (2, 1, 8, 8))
 
 if __name__ == "__main__":
     unittest.main()

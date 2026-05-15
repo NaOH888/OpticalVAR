@@ -15,11 +15,12 @@ if __package__ in {None, ""}:
     if str(SRC_ROOT) not in sys.path:
         sys.path.insert(0, str(SRC_ROOT))
 
+from conditioning import ConditionEmbeddingLayer, ConditionalLatentFusion, ContinuousMapLatentProjector, DiscreteCodeLatentProjector, LatentEmbeddingLayer
 from optical.core import DetectorConfig, PropagationConfig, PropagationErrorConfig, SourceConfig
 from optical.data import FrequencyPathDataset, MultiScaleFrequencyTargetTransform, NpzImageDataset
 from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.losses import OpticalMultiscaleLoss
-from optical.models import ConditionalPhaseSLMEncoder, OpticalMultiscaleModel, OpticalPrefixReadoutDecoder
+from optical.models import LatentPhaseMapEncoder, OpticalMultiscaleModel, OpticalPrefixReadoutDecoder, PhaseMapEncoder
 
 
 def _load_config(config_path: Path) -> dict[str, Any]:
@@ -134,7 +135,7 @@ def _build_initial_phase_map(
 def _build_model(
     config: dict[str, Any],
     *,
-    sample_target: torch.Tensor,
+    sample_item: dict[str, Any],
 ) -> OpticalMultiscaleModel:
     multiscale_cfg = dict(config["multiscale"])
     optical_cfg = dict(config["optical"])
@@ -222,27 +223,89 @@ def _build_model(
         default_error_factor=float(optical_cfg["error"].get("error_factor", 1.0)),
     )
 
-    encoder = ConditionalPhaseSLMEncoder(
-        input_channels=int(encoder_cfg.get("noise_channels", 1)),
-        input_height=int(encoder_cfg.get("input_height", sample_target.shape[-2])),
-        input_width=int(encoder_cfg.get("input_width", sample_target.shape[-1])),
-        output_height=int(encoder_cfg.get("output_height", slm.pixel_count_y)),
-        output_width=int(encoder_cfg.get("output_width", slm.pixel_count_x)),
-        hidden_dim=int(encoder_cfg.get("hidden_dim", 512)),
-        phase_alpha_pi=float(encoder_cfg.get("phase_alpha_pi", 2.0)),
-        time_conditional=bool(encoder_cfg.get("time_conditional", False)),
-        time_embedding_type=str(encoder_cfg.get("time_embedding_type", "positional")),
-        time_embedding_dim=int(encoder_cfg.get("time_embedding_dim", 128)),
-        class_conditional=bool(encoder_cfg.get("class_conditional", False)),
-        condition_mode=encoder_cfg.get("condition_mode"),
-        num_classes=int(encoder_cfg.get("num_classes", 0)),
-        condition_input_dim=encoder_cfg.get("condition_input_dim"),
-        class_embed_dim=int(encoder_cfg.get("class_embed_dim", 128)),
-        class_condition_channels=int(encoder_cfg.get("class_condition_channels", 4)),
-        condition_hidden_dim=encoder_cfg.get("condition_hidden_dim"),
-        weight_init=str(encoder_cfg.get("weight_init", "kaiming_uniform")),
-        output_weight_init=str(encoder_cfg.get("output_weight_init", "xavier_uniform")),
-        embedding_init_std=float(encoder_cfg.get("embedding_init_std", 0.02)),
+    latent_embed_dim = int(encoder_cfg.get("latent_embed_dim", encoder_cfg.get("hidden_dim", 512)))
+    condition_embed_dim = int(encoder_cfg.get("condition_embed_dim", encoder_cfg.get("class_embed_dim", 128)))
+    fused_dim = int(encoder_cfg.get("fused_dim", encoder_cfg.get("hidden_dim", 512)))
+    fusion_mode = str(encoder_cfg.get("fusion_mode", "concat"))
+    fusion_hidden_dim = encoder_cfg.get("fusion_hidden_dim")
+    condition_mode = encoder_cfg.get("condition_mode")
+    class_conditional = bool(encoder_cfg.get("class_conditional", False))
+
+    if "latent" in sample_item:
+        sample_latent = sample_item["latent"]
+        if not isinstance(sample_latent, torch.Tensor):
+            sample_latent = torch.as_tensor(sample_latent)
+        if sample_latent.dtype in {
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        }:
+            discrete_shape = sample_latent.reshape(-1).shape[0]
+            codebook_size = encoder_cfg.get("rvq_codebook_size")
+            if codebook_size is None:
+                raise ValueError("encoder.rvq_codebook_size must be provided for discrete latent inputs")
+            latent_projector = DiscreteCodeLatentProjector(
+                num_codebooks=discrete_shape,
+                codebook_size=int(codebook_size),
+                code_embed_dim=int(encoder_cfg.get("rvq_code_embed_dim", latent_embed_dim)),
+                output_dim=latent_embed_dim,
+                hidden_dim=encoder_cfg.get("latent_hidden_dim"),
+                fuse_codebooks=str(encoder_cfg.get("rvq_fuse_codebooks", "sum")),
+            )
+        else:
+            latent_shape = tuple(int(v) for v in sample_latent.shape)
+            latent_projector = ContinuousMapLatentProjector(
+                input_dim=int(torch.as_tensor(latent_shape).prod().item()),
+                output_dim=latent_embed_dim,
+                hidden_dim=encoder_cfg.get("latent_hidden_dim"),
+            )
+    else:
+        latent_projector = ContinuousMapLatentProjector(
+            input_dim=int(encoder_cfg.get("noise_channels", 1))
+            * int(encoder_cfg.get("input_height", sample_item["target_final"].shape[-2]))
+            * int(encoder_cfg.get("input_width", sample_item["target_final"].shape[-1])),
+            output_dim=latent_embed_dim,
+            hidden_dim=encoder_cfg.get("latent_hidden_dim"),
+        )
+
+    condition_layer = None
+    fusion_layer = None
+    if condition_mode is not None or class_conditional:
+        resolved_condition_mode = "class_index" if condition_mode is None else str(condition_mode)
+        condition_layer = ConditionEmbeddingLayer(
+            mode=resolved_condition_mode,
+            output_dim=condition_embed_dim,
+            num_classes=int(encoder_cfg.get("num_classes", 0)) if resolved_condition_mode == "class_index" else None,
+            input_dim=encoder_cfg.get("condition_input_dim") if resolved_condition_mode == "attribute_vector" else None,
+            embed_dim=int(encoder_cfg.get("class_embed_dim", 128)),
+            hidden_dim=encoder_cfg.get("condition_hidden_dim"),
+        )
+        fusion_layer = ConditionalLatentFusion(
+            latent_dim=latent_embed_dim,
+            condition_dim=condition_embed_dim,
+            output_dim=fused_dim,
+            mode=fusion_mode,
+            hidden_dim=fusion_hidden_dim,
+        )
+        phase_input_dim = fused_dim
+    else:
+        phase_input_dim = latent_embed_dim
+
+    encoder = LatentPhaseMapEncoder(
+        latent_layer=LatentEmbeddingLayer(projector=latent_projector),
+        condition_layer=condition_layer,
+        fusion_layer=fusion_layer,
+        phase_map_encoder=PhaseMapEncoder(
+            input_dim=phase_input_dim,
+            output_height=int(encoder_cfg.get("output_height", slm.pixel_count_y)),
+            output_width=int(encoder_cfg.get("output_width", slm.pixel_count_x)),
+            hidden_dim=int(encoder_cfg.get("hidden_dim", 512)),
+            phase_alpha_pi=float(encoder_cfg.get("phase_alpha_pi", 2.0)),
+            weight_init=str(encoder_cfg.get("weight_init", "kaiming_uniform")),
+            output_weight_init=str(encoder_cfg.get("output_weight_init", "xavier_uniform")),
+        ),
     )
     return OpticalMultiscaleModel(
         encoder=encoder,
@@ -310,10 +373,15 @@ def _build_fixed_latent_batch(
     sample_ids: torch.Tensor,
     *,
     latent_seed: int,
-    encoder: ConditionalPhaseSLMEncoder,
+    config: dict[str, Any],
     device: torch.device,
 ) -> torch.Tensor:
-    latent_shape = (encoder.input_channels, encoder.input_height, encoder.input_width)
+    encoder_cfg = dict(config["encoder"])
+    latent_shape = (
+        int(encoder_cfg.get("noise_channels", 1)),
+        int(encoder_cfg.get("input_height")),
+        int(encoder_cfg.get("input_width")),
+    )
     latents: list[torch.Tensor] = []
     for sample_id in sample_ids.tolist():
         generator = torch.Generator(device="cpu")
@@ -347,22 +415,10 @@ def _build_model_inputs(
     device: torch.device,
     latent_seed_override: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    encoder = model.encoder
-    if not isinstance(encoder, ConditionalPhaseSLMEncoder):
-        raise TypeError(
-            "train_optical_multiscale currently expects model.encoder to be ConditionalPhaseSLMEncoder, "
-            f"got {type(encoder).__name__}"
-        )
-
     if "latent" in batch:
-        latent = batch["latent"].to(device=device, dtype=torch.float32)
-        if latent.dim() != 4:
-            raise ValueError(f"dataset latent must be [B,C,H,W], got {tuple(latent.shape)}")
-        expected_shape = (encoder.input_channels, encoder.input_height, encoder.input_width)
-        if tuple(latent.shape[1:]) != expected_shape:
-            raise ValueError(
-                f"dataset latent shape must match encoder input shape {expected_shape}, got {tuple(latent.shape[1:])}"
-            )
+        latent = batch["latent"].to(device=device)
+        if latent.is_floating_point():
+            latent = latent.to(dtype=torch.float32)
         return latent, _resolve_condition_batch(batch, config=config, device=device)
 
     batch_size = int(batch["target_final"].shape[0])
@@ -379,7 +435,7 @@ def _build_model_inputs(
     noise = _build_fixed_latent_batch(
         sample_ids,
         latent_seed=latent_seed,
-        encoder=encoder,
+        config=config,
         device=device,
     )
     return noise, _resolve_condition_batch(batch, config=config, device=device)
@@ -400,8 +456,8 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
         config_dir=config_dir,
         repo_root=repo_root,
     )
-    sample_target = dataset[0]["target_final"]
-    model = _build_model(config, sample_target=sample_target).to(device)
+    sample_item = dataset[0]
+    model = _build_model(config, sample_item=sample_item).to(device)
     criterion = _build_loss(config, multiscale_transform=multiscale_transform)
     optimizer = torch.optim.Adam(
         model.parameters(),

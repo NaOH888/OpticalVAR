@@ -17,9 +17,12 @@ from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.models import (
     ConditionEmbeddingLayer,
     ConditionalPhaseSLMEncoder,
+    LatentPhaseMapEncoder,
     OpticalMultiscaleModel,
     OpticalPrefixReadoutDecoder,
+    PhaseMapEncoder,
 )
+from conditioning import ConditionalLatentFusion, ContinuousMapLatentProjector, DiscreteCodeLatentProjector, LatentEmbeddingLayer
 
 
 def _default_propagation_config() -> PropagationConfig:
@@ -124,6 +127,58 @@ class OpticalMultiscaleModelTests(unittest.TestCase):
         phase_b = encoder(sample, condition=cond_b)
         self.assertEqual(tuple(phase_a.shape), (2, 1, 4, 4))
         self.assertFalse(torch.allclose(phase_a, phase_b))
+
+    def test_phase_map_encoder_projects_vector_to_phase_map(self) -> None:
+        encoder = PhaseMapEncoder(
+            input_dim=12,
+            output_height=4,
+            output_width=5,
+            hidden_dim=16,
+            phase_alpha_pi=2.0,
+        )
+        output = encoder(torch.rand((3, 12), dtype=torch.float32))
+        self.assertEqual(tuple(output.shape), (3, 1, 4, 5))
+        self.assertTrue(torch.all(output >= 0.0).item())
+        self.assertTrue(torch.all(output < encoder.phase_period_rad).item())
+
+    def test_latent_phase_map_encoder_supports_discrete_codes_and_condition(self) -> None:
+        encoder = LatentPhaseMapEncoder(
+            latent_layer=LatentEmbeddingLayer(
+                projector=DiscreteCodeLatentProjector(
+                    num_codebooks=4,
+                    codebook_size=16,
+                    code_embed_dim=8,
+                    output_dim=10,
+                    hidden_dim=12,
+                )
+            ),
+            condition_layer=ConditionEmbeddingLayer(
+                mode="attribute_vector",
+                input_dim=5,
+                output_dim=10,
+                hidden_dim=12,
+            ),
+            fusion_layer=ConditionalLatentFusion(
+                latent_dim=10,
+                condition_dim=10,
+                output_dim=14,
+                mode="concat",
+                hidden_dim=16,
+            ),
+            phase_map_encoder=PhaseMapEncoder(
+                input_dim=14,
+                output_height=4,
+                output_width=4,
+                hidden_dim=16,
+                phase_alpha_pi=2.0,
+            ),
+        )
+        output = encoder(
+            torch.tensor([[1, 2, 3, 4], [0, 5, 7, 9]], dtype=torch.long),
+            condition=torch.tensor([[1, 0, 1, 0, 1], [0, 1, 0, 1, 0]], dtype=torch.float32),
+        )
+        self.assertEqual(tuple(output.shape), (2, 1, 4, 4))
+        self.assertTrue(torch.isfinite(output).all().item())
 
     def test_prefix_readout_decoder_returns_detector_plane_prefixes(self) -> None:
         source_config = SourceConfig(
