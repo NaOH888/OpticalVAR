@@ -121,6 +121,27 @@ class OpticalMultiscaleLossTests(unittest.TestCase):
         self.assertGreater(float(losses["tv_loss"]), 0.0)
         self.assertGreater(float(losses["total_loss"]), float(losses["final_loss"]))
 
+    def test_scale_aligned_losses_ignore_global_intensity_scaling(self) -> None:
+        transform = MultiScaleFrequencyTargetTransform(num_levels=2)
+        image = torch.arange(16, dtype=torch.float32).reshape(1, 4, 4) / 15.0
+        targets = transform(image)
+        outputs = {
+            "final_detector": (targets["target_final"] * 2.5).unsqueeze(1),
+            "prefix_readout_1": (targets["target_scale_1"] * 2.5).unsqueeze(1),
+            "prefix_readout_2": (targets["target_scale_2"] * 2.5).unsqueeze(1),
+        }
+        criterion = OpticalMultiscaleLoss(
+            num_levels=2,
+            final_weight=1.0,
+            scale_weight=1.0,
+            band_weight=0.0,
+        )
+
+        losses = criterion(outputs, targets)
+
+        self.assertTrue(torch.allclose(losses["final_loss"], torch.zeros(()), atol=1e-6))
+        self.assertTrue(torch.allclose(losses["scale_loss"], torch.zeros(()), atol=1e-6))
+
     def test_background_loss_is_reported_when_enabled(self) -> None:
         image = torch.zeros((1, 4, 4), dtype=torch.float32)
         outputs = {

@@ -84,6 +84,42 @@ class OpticalMultiscaleLoss(nn.Module):
         diff = prediction - target
         return torch.mean(diff.square())
 
+    def _scale_aligned_loss(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if prediction.shape != target.shape:
+            raise ValueError(
+                "prediction and target shapes must match, "
+                f"got {tuple(prediction.shape)} vs {tuple(target.shape)}"
+            )
+        batch_size = int(prediction.shape[0])
+        prediction_flat = prediction.reshape(batch_size, -1)
+        target_flat = target.reshape(batch_size, -1)
+        numerator = torch.sum(prediction_flat * target_flat, dim=1, keepdim=True)
+        denominator = torch.sum(prediction_flat.square(), dim=1, keepdim=True).clamp_min(1.0e-8)
+        scale = numerator / denominator
+        aligned_prediction = (prediction_flat * scale).reshape_as(prediction)
+        return self._base_loss(aligned_prediction, target)
+
+    @staticmethod
+    def _correlation_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if prediction.shape != target.shape:
+            raise ValueError(
+                "prediction and target shapes must match, "
+                f"got {tuple(prediction.shape)} vs {tuple(target.shape)}"
+            )
+        batch_size = int(prediction.shape[0])
+        prediction_flat = prediction.reshape(batch_size, -1)
+        target_flat = target.reshape(batch_size, -1)
+        prediction_centered = prediction_flat - prediction_flat.mean(dim=1, keepdim=True)
+        target_centered = target_flat - target_flat.mean(dim=1, keepdim=True)
+        prediction_norm = torch.linalg.norm(prediction_centered, dim=1)
+        target_norm = torch.linalg.norm(target_centered, dim=1)
+        numerator = torch.sum(prediction_centered * target_centered, dim=1)
+
+        both_small = (prediction_norm <= 1.0e-8) & (target_norm <= 1.0e-8)
+        correlation = numerator / (prediction_norm * target_norm).clamp_min(1.0e-8)
+        correlation = torch.where(both_small, torch.ones_like(correlation), correlation)
+        return torch.mean(1.0 - correlation)
+
     @staticmethod
     def _readout_image(readout: torch.Tensor) -> torch.Tensor:
         if readout.dim() != 4:
@@ -157,7 +193,7 @@ class OpticalMultiscaleLoss(nn.Module):
 
         final_prediction = self._readout_image(model_output["final_detector"])  # type: ignore[arg-type]
         final_target = self._target_image(target_output["target_final"])  # type: ignore[arg-type]
-        final_loss = self._base_loss(final_prediction, final_target)
+        final_loss = self._scale_aligned_loss(final_prediction, final_target)
 
         scale_losses: list[torch.Tensor] = []
         band_losses: list[torch.Tensor] = []
@@ -179,7 +215,7 @@ class OpticalMultiscaleLoss(nn.Module):
             readout_image = self._readout_image(model_output[readout_key])  # type: ignore[arg-type]
             scale_target = self._target_image(target_output[scale_key])  # type: ignore[arg-type]
             level_weight = float(self.level_weights[level_idx - 1])
-            scale_loss = self._base_loss(readout_image, scale_target)
+            scale_loss = self._scale_aligned_loss(readout_image, scale_target)
             scale_losses.append(scale_loss)
             weighted_scale_loss = weighted_scale_loss + (level_weight * scale_loss)
 
@@ -189,7 +225,7 @@ class OpticalMultiscaleLoss(nn.Module):
                 else:
                     predicted_band = self._extract_predicted_band(readout_image, level_idx)
                 band_target = self._target_image(target_output[band_key])  # type: ignore[arg-type]
-                band_loss = self._base_loss(predicted_band, band_target)
+                band_loss = self._correlation_loss(predicted_band, band_target)
                 band_losses.append(band_loss)
                 weighted_band_loss = weighted_band_loss + (level_weight * band_loss)
 
