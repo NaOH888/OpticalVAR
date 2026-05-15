@@ -14,7 +14,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from optical.data import NpzImageDataset
+from optical.data import NpzImageDataset, ReferencedImageLatentDataset
 
 
 class NpzDatasetTests(unittest.TestCase):
@@ -149,6 +149,67 @@ class NpzDatasetTests(unittest.TestCase):
             self.assertEqual(tuple(sample["image"].shape), (1, 2, 2))
             self.assertEqual(int(sample["sample_id"]), 12)
             self.assertTrue(torch.allclose(sample["label"], torch.tensor([1.0, 1.0])))
+            dataset.close()
+
+    def test_referenced_image_latent_dataset_can_join_image_and_rvq_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            image_npz = tmp_path / "images.npz"
+            image_manifest = tmp_path / "images.json"
+            latent_npz = tmp_path / "rvq.npz"
+            latent_manifest = tmp_path / "rvq.json"
+
+            np.savez(
+                image_npz,
+                images=np.ones((2, 1, 4, 4), dtype=np.float32),
+                labels=np.array([[1, 0], [0, 1]], dtype=np.float32),
+                sample_ids=np.array([10, 11], dtype=np.int64),
+            )
+            image_manifest.write_text(
+                json.dumps(
+                    {
+                        "image_key": "images",
+                        "label_key": "labels",
+                        "sample_id_key": "sample_ids",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            np.savez(
+                latent_npz,
+                rvq_codes=np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int64),
+                labels=np.array([[1, 0], [0, 1]], dtype=np.float32),
+                sample_ids=np.array([10, 11], dtype=np.int64),
+            )
+            latent_manifest.write_text(
+                json.dumps(
+                    {
+                        "image_manifest_path": image_manifest.name,
+                        "image_key": None,
+                        "label_key": "labels",
+                        "latent_source": "rvq",
+                        "latent_type": "discrete_code",
+                        "latent_key": "rvq_codes",
+                        "sample_id_key": "sample_ids",
+                        "latent_spec": {
+                            "num_stages": 3,
+                            "codebook_size": 256,
+                            "shape": [3],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            dataset = ReferencedImageLatentDataset.from_latent_manifest(latent_manifest)
+            sample = dataset[1]
+
+            self.assertEqual(tuple(sample["image"].shape), (1, 4, 4))
+            self.assertEqual(tuple(sample["latent"].shape), (3,))
+            self.assertEqual(sample["latent"].dtype, torch.long)
+            self.assertEqual(int(sample["sample_id"]), 11)
+            self.assertTrue(torch.allclose(sample["label"], torch.tensor([0.0, 1.0])))
             dataset.close()
 
 

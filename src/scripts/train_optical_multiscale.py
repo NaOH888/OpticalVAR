@@ -17,7 +17,7 @@ if __package__ in {None, ""}:
 
 from conditioning import ConditionEmbeddingLayer, ConditionalLatentFusion, ContinuousMapLatentProjector, DiscreteCodeLatentProjector, LatentEmbeddingLayer
 from optical.core import DetectorConfig, PropagationConfig, PropagationErrorConfig, SourceConfig
-from optical.data import FrequencyPathDataset, MultiScaleFrequencyTargetTransform, NpzImageDataset
+from optical.data import FrequencyPathDataset, MultiScaleFrequencyTargetTransform, NpzImageDataset, ReferencedImageLatentDataset
 from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.losses import OpticalMultiscaleLoss
 from optical.models import LatentPhaseMapEncoder, OpticalMultiscaleModel, OpticalPrefixReadoutDecoder, PhaseMapEncoder
@@ -65,11 +65,19 @@ def _build_dataset_and_loader(
     dataset_cfg = dict(config["dataset"])
     multiscale_cfg = dict(config["multiscale"])
     dataset_path = _resolve_path(dataset_cfg["manifest_path"], config_dir=config_dir, repo_root=repo_root)
-    base_dataset = NpzImageDataset.from_manifest(
-        dataset_path,
-        max_items=dataset_cfg.get("max_items"),
-        channel_mode=str(dataset_cfg.get("channel_mode", "keep")),
-    )
+    manifest_payload = json.loads(dataset_path.read_text(encoding="utf-8"))
+    if "image_manifest_path" in manifest_payload:
+        base_dataset = ReferencedImageLatentDataset.from_latent_manifest(
+            dataset_path,
+            max_items=dataset_cfg.get("max_items"),
+            channel_mode=str(dataset_cfg.get("channel_mode", "keep")),
+        )
+    else:
+        base_dataset = NpzImageDataset.from_manifest(
+            dataset_path,
+            max_items=dataset_cfg.get("max_items"),
+            channel_mode=str(dataset_cfg.get("channel_mode", "keep")),
+        )
     target_transform = MultiScaleFrequencyTargetTransform(
         num_levels=int(multiscale_cfg["num_levels"]),
         max_freq_fraction=float(multiscale_cfg.get("max_freq_fraction", 1.0)),

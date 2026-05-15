@@ -1,0 +1,22 @@
+{
+  "runtime": {
+    "seed": 42
+  },
+  "dataset": {
+    "dataset_name": "celeba",
+    "split": "train",
+    "manifest_path": "dataset/celeba/celeba_train_gray_176.json",
+    "channel_mode": "keep",
+    "max_items": null
+  },
+  "rvq": {
+    "pca_dim": 256,
+    "num_stages": 4,
+    "codebook_size": 256,
+    "batch_size": 512
+  },
+  "export": {
+    "shard_size": 4096,
+    "output_manifest_path": "dataset/celeba_rvq/celeba_train_rvq.json"
+  }
+}
