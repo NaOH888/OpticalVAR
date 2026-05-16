@@ -42,6 +42,13 @@ class ExportRVQPairsTests(unittest.TestCase):
                         "image_key": "images",
                         "label_key": "labels",
                         "sample_id_key": "sample_ids",
+                        "label_names": ["attr_a", "attr_b", "left_eye_x", "left_eye_y"],
+                        "label_semantics": "attrs_plus_landmarks",
+                        "condition_components": {
+                            "attributes_dim": 2,
+                            "landmarks_dim": 2,
+                            "total_dim": 4,
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -80,6 +87,8 @@ class ExportRVQPairsTests(unittest.TestCase):
             self.assertEqual(payload["num_items"], 8)
             self.assertEqual(len(payload["npz_files"]), 2)
             self.assertTrue((output_dir / payload["latent_spec"]["rvq_model_file"]).exists())
+            self.assertEqual(payload["label_names"], ["attr_a", "attr_b", "left_eye_x", "left_eye_y"])
+            self.assertEqual(payload["condition_components"]["total_dim"], 4)
 
             dataset = ReferencedImageLatentDataset.from_latent_manifest(latent_manifest)
             sample = dataset[0]

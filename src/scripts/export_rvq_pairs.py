@@ -156,6 +156,7 @@ def _save_rvq_shards(
     *,
     output_manifest: Path,
     image_manifest: Path,
+    image_manifest_payload: dict[str, Any],
     labels: np.ndarray,
     sample_ids: np.ndarray,
     rvq_codes: np.ndarray,
@@ -219,6 +220,9 @@ def _save_rvq_shards(
             "pca_dim": int(config["rvq"]["pca_dim"]),
             "rvq_model_file": model_name,
         },
+        "label_names": image_manifest_payload.get("label_names"),
+        "label_semantics": image_manifest_payload.get("label_semantics"),
+        "condition_components": image_manifest_payload.get("condition_components"),
         "npz_files": npz_files,
         "shards": shards,
         "config": config,
@@ -241,6 +245,7 @@ def export_pairs(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]
     export_cfg = dict(config["export"])
 
     image_manifest = _resolve_path(dataset_cfg["manifest_path"], config_dir=config_dir, repo_root=repo_root)
+    image_manifest_payload = _load_manifest(image_manifest)
     ipca = _fit_incremental_pca(
         image_manifest,
         pca_dim=int(rvq_cfg["pca_dim"]),
@@ -266,6 +271,7 @@ def export_pairs(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]
     return _save_rvq_shards(
         output_manifest=output_manifest,
         image_manifest=image_manifest,
+        image_manifest_payload=image_manifest_payload,
         labels=labels,
         sample_ids=sample_ids,
         rvq_codes=rvq_codes,

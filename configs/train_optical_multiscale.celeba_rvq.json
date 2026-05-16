@@ -4,7 +4,7 @@
     "device": "cuda"
   },
   "dataset": {
-    "manifest_path": "dataset/celeba_rvq/celeba_train_rvq.json",
+    "manifest_path": "dataset/celeba_rvq/celeba_train_rvq_lm.json",
     "channel_mode": "keep",
     "batch_size": 16,
     "shuffle": true,
@@ -31,7 +31,7 @@
     "output_width": 176,
     "phase_alpha_pi": 2.0,
     "condition_mode": "attribute_vector",
-    "condition_input_dim": 40,
+    "condition_input_dim": 50,
     "class_embed_dim": 128,
     "condition_hidden_dim": 256,
     "weight_init": "kaiming_uniform",

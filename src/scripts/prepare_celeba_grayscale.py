@@ -29,6 +29,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--crop-size", type=int, default=176, help="Center crop size. Default keeps cVAE-compatible 176.")
     parser.add_argument("--shard-size", type=int, default=4096, help="Samples per NPZ shard. Use a positive value.")
     parser.add_argument("--compress", action="store_true", help="Use np.savez_compressed for smaller but slower output.")
+    parser.add_argument(
+        "--include-landmarks",
+        action="store_true",
+        help="Append normalized aligned CelebA landmarks to the 40-d attribute condition vector.",
+    )
     return parser.parse_args(argv)
 
 
@@ -62,6 +67,38 @@ def _read_attr_table(attr_path: Path, *, selected_filenames: set[str]) -> tuple[
             # CelebA attributes are stored as -1 / 1; convert to 0 / 1.
             attr_map[filename] = ((attr_values + 1) // 2).astype(np.float32, copy=False)
     return attr_names, attr_map
+
+
+def _read_landmark_table(
+    landmark_path: Path,
+    *,
+    selected_filenames: set[str],
+    crop_size: int,
+) -> tuple[list[str], dict[str, np.ndarray]]:
+    with landmark_path.open("r", encoding="utf-8") as handle:
+        _ = handle.readline()
+        landmark_names = handle.readline().split()
+        landmark_map: dict[str, np.ndarray] = {}
+        for line in handle:
+            parts = line.split()
+            if not parts:
+                continue
+            filename = parts[0]
+            if filename not in selected_filenames:
+                continue
+            landmark_values = np.asarray(parts[1:], dtype=np.float32)
+            if landmark_values.shape[0] % 2 != 0:
+                raise ValueError(
+                    f"landmark row for {filename!r} must contain x/y pairs, got {landmark_values.shape[0]} values"
+                )
+            coords = landmark_values.reshape(-1, 2)
+            left = float((178 - crop_size) // 2)
+            top = float((218 - crop_size) // 2)
+            coords[:, 0] = (coords[:, 0] - left) / float(max(crop_size - 1, 1))
+            coords[:, 1] = (coords[:, 1] - top) / float(max(crop_size - 1, 1))
+            coords = np.clip(coords, 0.0, 1.0)
+            landmark_map[filename] = coords.reshape(-1).astype(np.float32, copy=False)
+    return landmark_names, landmark_map
 
 
 def _center_crop_rgb(image: Image.Image, crop_size: int) -> np.ndarray:
@@ -121,20 +158,42 @@ def main(argv: list[str] | None = None) -> None:
     zip_path = celeba_root / "img_align_celeba.zip"
     attr_path = celeba_root / "list_attr_celeba.txt"
     partition_path = celeba_root / "list_eval_partition.txt"
+    landmark_path = celeba_root / "list_landmarks_align_celeba.txt"
 
-    for required_path in (zip_path, attr_path, partition_path):
+    required_paths = [zip_path, attr_path, partition_path]
+    if bool(args.include_landmarks):
+        required_paths.append(landmark_path)
+    for required_path in required_paths:
         if not required_path.exists():
             raise FileNotFoundError(f"Required CelebA file not found: {required_path}")
 
     filenames = _read_partition_filenames(partition_path, split=str(args.split))
     filename_set = set(filenames)
     attr_names, attr_map = _read_attr_table(attr_path, selected_filenames=filename_set)
+    landmark_names: list[str] = []
+    landmark_map: dict[str, np.ndarray] | None = None
+    if bool(args.include_landmarks):
+        landmark_names, landmark_map = _read_landmark_table(
+            landmark_path,
+            selected_filenames=filename_set,
+            crop_size=int(args.crop_size),
+        )
     missing_attrs = [filename for filename in filenames if filename not in attr_map]
     if missing_attrs:
         raise ValueError(f"Missing attribute rows for {len(missing_attrs)} files, first={missing_attrs[0]!r}")
+    if landmark_map is not None:
+        missing_landmarks = [filename for filename in filenames if filename not in landmark_map]
+        if missing_landmarks:
+            raise ValueError(
+                f"Missing landmark rows for {len(missing_landmarks)} files, first={missing_landmarks[0]!r}"
+            )
 
     root.mkdir(parents=True, exist_ok=True)
-    output_prefix = f"celeba_{args.split}_gray_{int(args.crop_size)}"
+    output_prefix = (
+        f"celeba_{args.split}_gray_{int(args.crop_size)}_lm"
+        if bool(args.include_landmarks)
+        else f"celeba_{args.split}_gray_{int(args.crop_size)}"
+    )
 
     shard_images: list[np.ndarray] = []
     shard_labels: list[np.ndarray] = []
@@ -148,7 +207,12 @@ def main(argv: list[str] | None = None) -> None:
             with archive.open(member_name, mode="r") as member_handle:
                 with Image.open(member_handle) as image:
                     shard_images.append(_center_crop_rgb(image, int(args.crop_size)))
-            shard_labels.append(attr_map[filename])
+            if landmark_map is None:
+                shard_labels.append(attr_map[filename])
+            else:
+                shard_labels.append(
+                    np.concatenate((attr_map[filename], landmark_map[filename]), axis=0).astype(np.float32, copy=False)
+                )
             shard_sample_ids.append(sample_id)
 
             if len(shard_images) >= int(args.shard_size):
@@ -194,8 +258,17 @@ def main(argv: list[str] | None = None) -> None:
         "sample_id_key": "sample_ids",
         "npz_files": [record["filename"] for record in shard_records],
         "shards": shard_records,
-        "label_names": attr_names,
-        "label_semantics": "celeba_40_attributes_binary_0_1",
+        "label_names": attr_names + landmark_names,
+        "label_semantics": (
+            "celeba_40_attributes_binary_0_1+aligned_landmarks_xy_normalized_0_1"
+            if bool(args.include_landmarks)
+            else "celeba_40_attributes_binary_0_1"
+        ),
+        "condition_components": {
+            "attributes_dim": 40,
+            "landmarks_dim": 10 if bool(args.include_landmarks) else 0,
+            "total_dim": 40 + (10 if bool(args.include_landmarks) else 0),
+        },
         "image_shape_nchw": [int(len(filenames)), 1, int(args.crop_size), int(args.crop_size)],
         "image_dtype": "float16",
         "image_value_range": [0.0, 1.0],
@@ -204,9 +277,11 @@ def main(argv: list[str] | None = None) -> None:
         "channel_mode": "keep",
         "raw_zip_path": str(zip_path),
         "attribute_path": str(attr_path),
+        "landmark_path": str(landmark_path) if bool(args.include_landmarks) else None,
         "partition_path": str(partition_path),
         "shard_size": int(args.shard_size),
         "compress": bool(args.compress),
+        "include_landmarks": bool(args.include_landmarks),
     }
     manifest_path = root / f"{output_prefix}.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")

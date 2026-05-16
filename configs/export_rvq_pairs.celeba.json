@@ -5,7 +5,7 @@
   "dataset": {
     "dataset_name": "celeba",
     "split": "train",
-    "manifest_path": "dataset/celeba/celeba_train_gray_176.json",
+    "manifest_path": "dataset/celeba/celeba_train_gray_176_lm.json",
     "channel_mode": "keep",
     "max_items": null
   },
@@ -17,6 +17,6 @@
   },
   "export": {
     "shard_size": 4096,
-    "output_manifest_path": "dataset/celeba_rvq/celeba_train_rvq.json"
+    "output_manifest_path": "dataset/celeba_rvq/celeba_train_rvq_lm.json"
   }
 }

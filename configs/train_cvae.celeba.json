@@ -4,7 +4,7 @@
     "device": "cuda"
   },
   "dataset": {
-    "manifest_path": "dataset/celeba/celeba_train_gray_176.json",
+    "manifest_path": "dataset/celeba/celeba_train_gray_176_lm.json",
     "channel_mode": "keep",
     "batch_size": 128,
     "shuffle": true,
@@ -17,7 +17,7 @@
     "latent_height": 8,
     "latent_width": 8,
     "condition_mode": "attribute_vector",
-    "condition_input_dim": 40,
+    "condition_input_dim": 50,
     "condition_embed_dim": 64,
     "condition_hidden_dim": 256,
     "condition_channels": 32,
