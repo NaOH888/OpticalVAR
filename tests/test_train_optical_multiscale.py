@@ -412,5 +412,20 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             payload = json.loads(history_lines[-1])
             self.assertIn("perceptual_loss", payload)
 
+    def test_training_logs_latent_diversity_loss_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, outputs_dir, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["loss"]["latent_diversity_weight"] = 0.1
+            config["loss"]["latent_diversity_margin"] = 0.05
+
+            result = train(config, config_path=config_path)
+
+            self.assertIn("latent_diversity_loss", result["metrics"])
+            history_lines = (outputs_dir / "history.jsonl").read_text(encoding="utf-8").strip().splitlines()
+            payload = json.loads(history_lines[-1])
+            self.assertIn("latent_diversity_loss", payload)
+
 if __name__ == "__main__":
     unittest.main()

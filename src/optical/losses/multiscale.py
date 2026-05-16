@@ -32,6 +32,8 @@ class OpticalMultiscaleLoss(nn.Module):
         background_threshold: float = 0.05,
         perceptual_weight: float = 0.0,
         perceptual_loss_fn: PerceptualLoss | None = None,
+        latent_diversity_weight: float = 0.0,
+        latent_diversity_margin: float = 0.05,
         loss_type: Literal["mse", "l1"] = "mse",
         band_mode: Literal["prefix_difference", "frequency_transform"] = "prefix_difference",
         level_weights: Sequence[float] | None = None,
@@ -57,6 +59,8 @@ class OpticalMultiscaleLoss(nn.Module):
         self.background_threshold = float(background_threshold)
         self.perceptual_weight = float(perceptual_weight)
         self.perceptual_loss_fn = perceptual_loss_fn
+        self.latent_diversity_weight = float(latent_diversity_weight)
+        self.latent_diversity_margin = float(latent_diversity_margin)
         self.loss_type = loss_type
         self.band_mode = band_mode
         self.band_transform = band_transform
@@ -195,10 +199,57 @@ class OpticalMultiscaleLoss(nn.Module):
         denom = mask.sum().clamp_min(1.0)
         return ((prediction.square()) * mask).sum() / denom
 
+    def _latent_diversity_loss(
+        self,
+        prediction: torch.Tensor,
+        latent_input: torch.Tensor,
+    ) -> torch.Tensor:
+        if prediction.dim() != 3:
+            raise ValueError(f"prediction must be [B,H,W], got {tuple(prediction.shape)}")
+        if latent_input.shape[0] != prediction.shape[0]:
+            raise ValueError(
+                "latent_input batch size must match prediction batch size, "
+                f"got {tuple(latent_input.shape)} vs {tuple(prediction.shape)}"
+            )
+        batch_size = int(prediction.shape[0])
+        if batch_size < 2:
+            return prediction.new_zeros(())
+
+        prediction_flat = prediction.reshape(batch_size, -1)
+        pred_pairwise = torch.mean(
+            torch.abs(prediction_flat.unsqueeze(1) - prediction_flat.unsqueeze(0)),
+            dim=-1,
+        )
+
+        if latent_input.is_floating_point():
+            latent_flat = latent_input.reshape(batch_size, -1)
+            latent_norm = torch.linalg.norm(latent_flat, dim=1, keepdim=True).clamp_min(1.0e-8)
+            latent_unit = latent_flat / latent_norm
+            cosine_similarity = torch.matmul(latent_unit, latent_unit.T).clamp(-1.0, 1.0)
+            latent_pairwise = 0.5 * (1.0 - cosine_similarity)
+        else:
+            latent_flat = latent_input.reshape(batch_size, -1)
+            latent_pairwise = torch.mean(
+                (latent_flat.unsqueeze(1) != latent_flat.unsqueeze(0)).to(dtype=prediction.dtype),
+                dim=-1,
+            )
+
+        target_margin = self.latent_diversity_margin * latent_pairwise.to(dtype=prediction.dtype)
+        pairwise_penalty = torch.relu(target_margin - pred_pairwise)
+        upper_mask = torch.triu(
+            torch.ones((batch_size, batch_size), device=prediction.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        if not torch.any(upper_mask):
+            return prediction.new_zeros(())
+        return torch.mean(pairwise_penalty[upper_mask])
+
     def forward(
         self,
         model_output: dict[str, torch.Tensor | tuple[torch.Tensor, ...]],
         target_output: dict[str, torch.Tensor | tuple[torch.Tensor, ...] | object],
+        *,
+        latent_input: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | tuple[torch.Tensor, ...]]:
         if "final_detector" not in model_output:
             raise KeyError("model_output must contain 'final_detector'")
@@ -264,9 +315,15 @@ class OpticalMultiscaleLoss(nn.Module):
             if self.perceptual_weight != 0.0 and self.perceptual_loss_fn is not None
             else final_loss.new_zeros(())
         )
+        latent_diversity_loss = (
+            self._latent_diversity_loss(final_prediction, latent_input)
+            if self.latent_diversity_weight != 0.0 and latent_input is not None
+            else final_loss.new_zeros(())
+        )
         total = total + self.tv_weight * tv_loss
         total = total + self.background_weight * background_loss
         total = total + self.perceptual_weight * perceptual_loss
+        total = total + self.latent_diversity_weight * latent_diversity_loss
         scale_loss_mean = torch.stack(scale_losses).mean() if scale_losses else final_loss.new_zeros(())
         if band_losses:
             band_loss_mean = torch.stack(band_losses).mean()
@@ -281,6 +338,7 @@ class OpticalMultiscaleLoss(nn.Module):
             "tv_loss": tv_loss,
             "background_loss": background_loss,
             "perceptual_loss": perceptual_loss,
+            "latent_diversity_loss": latent_diversity_loss,
             "scale_losses": tuple(scale_losses),
             "band_losses": tuple(band_losses),
         }

@@ -210,6 +210,32 @@ class OpticalMultiscaleLossTests(unittest.TestCase):
 
         self.assertEqual(criterion.level_weights, (3.0, 2.0, 1.0))
 
+    def test_latent_diversity_loss_penalizes_collapsed_outputs(self) -> None:
+        image = torch.zeros((2, 8, 8), dtype=torch.float32)
+        outputs = {
+            "final_detector": image.unsqueeze(1),
+            "prefix_readout_1": image.unsqueeze(1),
+        }
+        targets = {
+            "target_final": image,
+            "target_scale_1": image,
+            "target_band_1": image,
+        }
+        latent_input = torch.tensor([[0, 0, 0], [1, 1, 1]], dtype=torch.long)
+        criterion = OpticalMultiscaleLoss(
+            num_levels=1,
+            final_weight=1.0,
+            scale_weight=0.0,
+            band_weight=0.0,
+            latent_diversity_weight=1.0,
+            latent_diversity_margin=0.2,
+        )
+
+        losses = criterion(outputs, targets, latent_input=latent_input)
+
+        self.assertGreater(float(losses["latent_diversity_loss"]), 0.0)
+        self.assertGreater(float(losses["total_loss"]), float(losses["final_loss"]))
+
 
 if __name__ == "__main__":
     unittest.main()

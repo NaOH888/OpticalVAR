@@ -406,6 +406,8 @@ def _build_loss(
         background_threshold=float(loss_cfg.get("background_threshold", 0.05)),
         perceptual_weight=float(loss_cfg.get("perceptual_weight", 0.0)),
         perceptual_loss_fn=perceptual_loss_fn,
+        latent_diversity_weight=float(loss_cfg.get("latent_diversity_weight", 0.0)),
+        latent_diversity_margin=float(loss_cfg.get("latent_diversity_margin", 0.05)),
         loss_type=str(loss_cfg.get("loss_type", "mse")),
         band_mode=band_mode,
         level_weights=loss_cfg.get("level_weights"),
@@ -695,6 +697,7 @@ def train(
         running_tv = 0.0
         running_background = 0.0
         running_perceptual = 0.0
+        running_latent_diversity = 0.0
         step_count = 0
 
         for step_idx, batch in enumerate(loader, start=1):
@@ -706,7 +709,7 @@ def train(
                 device=device,
             )
             model_output = model(model_input, class_labels=class_labels)
-            loss_output = criterion(model_output, batch)
+            loss_output = criterion(model_output, batch, latent_input=model_input)
             total_loss = loss_output["total_loss"]
 
             optimizer.zero_grad(set_to_none=True)
@@ -720,6 +723,7 @@ def train(
             running_tv += float(loss_output["tv_loss"].detach().cpu())
             running_background += float(loss_output["background_loss"].detach().cpu())
             running_perceptual += float(loss_output["perceptual_loss"].detach().cpu())
+            running_latent_diversity += float(loss_output["latent_diversity_loss"].detach().cpu())
             step_count += 1
 
             if step_idx % log_interval == 0:
@@ -731,7 +735,8 @@ def train(
                     f"band={running_band / step_count:.6f} "
                     f"tv={running_tv / step_count:.6f} "
                     f"bg={running_background / step_count:.6f} "
-                    f"perc={running_perceptual / step_count:.6f}"
+                    f"perc={running_perceptual / step_count:.6f} "
+                    f"latent_div={running_latent_diversity / step_count:.6f}"
                 )
 
             if max_steps_per_epoch is not None and step_idx >= int(max_steps_per_epoch):
@@ -749,6 +754,7 @@ def train(
             "tv_loss": running_tv / step_count,
             "background_loss": running_background / step_count,
             "perceptual_loss": running_perceptual / step_count,
+            "latent_diversity_loss": running_latent_diversity / step_count,
             "level_weights": list(criterion.level_weights),
         }
         print(
@@ -760,6 +766,7 @@ def train(
             f"tv={latest_metrics['tv_loss']:.6f} "
             f"bg={latest_metrics['background_loss']:.6f} "
             f"perc={latest_metrics['perceptual_loss']:.6f} "
+            f"latent_div={latest_metrics['latent_diversity_loss']:.6f} "
             f"level_weights={latest_metrics['level_weights']}"
         )
         _append_jsonl(history_path, latest_metrics)
