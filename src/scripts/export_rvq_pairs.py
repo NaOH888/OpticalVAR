@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,42 @@ def _resolve_path(path_value: str, *, config_dir: Path, repo_root: Path) -> Path
 
 def _load_manifest(manifest_path: Path) -> dict[str, Any]:
     return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def _count_manifest_items(manifest_path: Path) -> int:
+    payload = _load_manifest(manifest_path)
+    num_items = payload.get("num_items")
+    if num_items is not None:
+        return int(num_items)
+
+    sample_id_key = str(payload.get("sample_id_key", "sample_ids"))
+    npz_files = payload.get("npz_files")
+    if npz_files is None:
+        npz_files = [manifest_path.name.replace(".json", ".npz")]
+    total_items = 0
+    for filename in npz_files:
+        shard_path = (manifest_path.parent / str(filename)).resolve()
+        archive = np.load(shard_path, allow_pickle=False)
+        try:
+            if sample_id_key in archive.files:
+                total_items += int(archive[sample_id_key].shape[0])
+            else:
+                image_key = str(payload.get("image_key", "images"))
+                total_items += int(archive[image_key].shape[0])
+        finally:
+            archive.close()
+    return total_items
+
+
+def _format_seconds(seconds: float) -> str:
+    total_seconds = max(float(seconds), 0.0)
+    minutes, secs = divmod(int(total_seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    if minutes > 0:
+        return f"{minutes:d}m{secs:02d}s"
+    return f"{secs:d}s"
 
 
 def _iter_source_shards(
@@ -83,6 +120,15 @@ def _fit_incremental_pca(
     channel_mode: str,
 ) -> IncrementalPCA:
     ipca = IncrementalPCA(n_components=int(pca_dim), batch_size=int(batch_size))
+    total_items = min(
+        _count_manifest_items(manifest_path),
+        int(max_items) if max_items is not None else _count_manifest_items(manifest_path),
+    )
+    processed_items = 0
+    start_time = time.perf_counter()
+    print(
+        f"[export_rvq][pca_fit] start total_items={total_items} pca_dim={int(pca_dim)} batch_size={int(batch_size)}"
+    )
     for images, _, _ in _iter_source_shards(
         manifest_path,
         max_items=max_items,
@@ -90,7 +136,19 @@ def _fit_incremental_pca(
     ):
         flat = images.reshape(images.shape[0], -1)
         for start in range(0, flat.shape[0], int(batch_size)):
-            ipca.partial_fit(flat[start : start + int(batch_size)])
+            batch = flat[start : start + int(batch_size)]
+            ipca.partial_fit(batch)
+            processed_items += int(batch.shape[0])
+            if processed_items % max(int(batch_size) * 20, 1) == 0 or processed_items >= total_items:
+                elapsed = time.perf_counter() - start_time
+                print(
+                    f"[export_rvq][pca_fit] processed={processed_items}/{total_items} "
+                    f"elapsed={_format_seconds(elapsed)}"
+                )
+    print(
+        f"[export_rvq][pca_fit] done processed={processed_items}/{total_items} "
+        f"elapsed={_format_seconds(time.perf_counter() - start_time)}"
+    )
     return ipca
 
 
@@ -105,6 +163,13 @@ def _project_dataset(
     features_list: list[np.ndarray] = []
     labels_list: list[np.ndarray] = []
     sample_ids_list: list[np.ndarray] = []
+    total_items = min(
+        _count_manifest_items(manifest_path),
+        int(max_items) if max_items is not None else _count_manifest_items(manifest_path),
+    )
+    processed_items = 0
+    start_time = time.perf_counter()
+    print(f"[export_rvq][project] start total_items={total_items} batch_size={int(batch_size)}")
     for images, labels, sample_ids in _iter_source_shards(
         manifest_path,
         max_items=max_items,
@@ -113,10 +178,22 @@ def _project_dataset(
         flat = images.reshape(images.shape[0], -1)
         projected_batches: list[np.ndarray] = []
         for start in range(0, flat.shape[0], int(batch_size)):
-            projected_batches.append(ipca.transform(flat[start : start + int(batch_size)]).astype(np.float32, copy=False))
+            batch = flat[start : start + int(batch_size)]
+            projected_batches.append(ipca.transform(batch).astype(np.float32, copy=False))
+            processed_items += int(batch.shape[0])
+            if processed_items % max(int(batch_size) * 20, 1) == 0 or processed_items >= total_items:
+                elapsed = time.perf_counter() - start_time
+                print(
+                    f"[export_rvq][project] processed={processed_items}/{total_items} "
+                    f"elapsed={_format_seconds(elapsed)}"
+                )
         features_list.append(np.concatenate(projected_batches, axis=0))
         labels_list.append(labels)
         sample_ids_list.append(sample_ids.astype(np.int64, copy=False))
+    print(
+        f"[export_rvq][project] done processed={processed_items}/{total_items} "
+        f"elapsed={_format_seconds(time.perf_counter() - start_time)}"
+    )
     return (
         np.concatenate(features_list, axis=0),
         np.concatenate(labels_list, axis=0),
@@ -135,20 +212,34 @@ def _perform_rvq(
     residual = features.astype(np.float32, copy=True)
     codes = np.empty((features.shape[0], int(num_stages)), dtype=np.int32)
     codebooks: list[np.ndarray] = []
+    total_items = int(features.shape[0])
+    print(
+        f"[export_rvq][rvq] start total_items={total_items} stages={int(num_stages)} "
+        f"codebook_size={int(codebook_size)} batch_size={int(batch_size)}"
+    )
     for stage_idx in range(int(num_stages)):
+        stage_start = time.perf_counter()
         kmeans = MiniBatchKMeans(
             n_clusters=int(codebook_size),
             batch_size=int(batch_size),
             random_state=int(seed) + stage_idx,
             n_init="auto",
         )
+        print(f"[export_rvq][rvq] stage={stage_idx + 1}/{int(num_stages)} fit")
         kmeans.fit(residual)
+        print(f"[export_rvq][rvq] stage={stage_idx + 1}/{int(num_stages)} assign")
         stage_codes = kmeans.predict(residual).astype(np.int32, copy=False)
         stage_centers = kmeans.cluster_centers_.astype(np.float32, copy=False)
         quantized = stage_centers[stage_codes]
         codes[:, stage_idx] = stage_codes
         codebooks.append(stage_centers)
         residual = residual - quantized
+        residual_norm = float(np.linalg.norm(residual) / max(total_items, 1))
+        print(
+            f"[export_rvq][rvq] stage={stage_idx + 1}/{int(num_stages)} done "
+            f"elapsed={_format_seconds(time.perf_counter() - stage_start)} "
+            f"residual_norm_per_item={residual_norm:.6f}"
+        )
     return codes, np.stack(codebooks, axis=0)
 
 
@@ -175,6 +266,10 @@ def _save_rvq_shards(
         end = min(start + int(shard_size), rvq_codes.shape[0])
         shard_name = f"{output_prefix}_part{shard_index:04d}.npz"
         shard_path = output_manifest.parent / shard_name
+        print(
+            f"[export_rvq][save] shard={shard_index + 1} items={end - start} "
+            f"range=[{start},{end}) path={shard_name}"
+        )
         np.savez(
             shard_path,
             rvq_codes=rvq_codes[start:end].astype(code_dtype, copy=False),
@@ -246,6 +341,12 @@ def export_pairs(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]
 
     image_manifest = _resolve_path(dataset_cfg["manifest_path"], config_dir=config_dir, repo_root=repo_root)
     image_manifest_payload = _load_manifest(image_manifest)
+    overall_start = time.perf_counter()
+    print(
+        f"[export_rvq] start manifest={image_manifest} num_items={image_manifest_payload.get('num_items')} "
+        f"max_items={dataset_cfg.get('max_items')} pca_dim={int(rvq_cfg['pca_dim'])} "
+        f"stages={int(rvq_cfg['num_stages'])} codebook_size={int(rvq_cfg['codebook_size'])}"
+    )
     ipca = _fit_incremental_pca(
         image_manifest,
         pca_dim=int(rvq_cfg["pca_dim"]),
@@ -268,7 +369,7 @@ def export_pairs(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]
         seed=int(runtime_cfg.get("seed", 42)),
     )
     output_manifest = _resolve_path(export_cfg["output_manifest_path"], config_dir=config_dir, repo_root=repo_root)
-    return _save_rvq_shards(
+    result = _save_rvq_shards(
         output_manifest=output_manifest,
         image_manifest=image_manifest,
         image_manifest_payload=image_manifest_payload,
@@ -280,6 +381,11 @@ def export_pairs(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]
         config=config,
         shard_size=int(export_cfg.get("shard_size", 4096)),
     )
+    print(
+        f"[export_rvq] done output_manifest={result['output_manifest']} "
+        f"elapsed={_format_seconds(time.perf_counter() - overall_start)}"
+    )
+    return result
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
