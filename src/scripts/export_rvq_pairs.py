@@ -120,9 +120,10 @@ def _fit_incremental_pca(
     channel_mode: str,
 ) -> IncrementalPCA:
     ipca = IncrementalPCA(n_components=int(pca_dim), batch_size=int(batch_size))
+    manifest_items = _count_manifest_items(manifest_path)
     total_items = min(
-        _count_manifest_items(manifest_path),
-        int(max_items) if max_items is not None else _count_manifest_items(manifest_path),
+        manifest_items,
+        int(max_items) if max_items is not None else manifest_items,
     )
     processed_items = 0
     start_time = time.perf_counter()
@@ -208,15 +209,23 @@ def _perform_rvq(
     codebook_size: int,
     batch_size: int,
     seed: int,
+    fit_max_items: int | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     residual = features.astype(np.float32, copy=True)
     codes = np.empty((features.shape[0], int(num_stages)), dtype=np.int32)
     codebooks: list[np.ndarray] = []
     total_items = int(features.shape[0])
+    rng = np.random.default_rng(int(seed))
+    fit_indices: np.ndarray | None = None
+    fit_items = total_items
+    if fit_max_items is not None and int(fit_max_items) > 0 and int(fit_max_items) < total_items:
+        fit_items = int(fit_max_items)
+        fit_indices = np.sort(rng.choice(total_items, size=fit_items, replace=False))
     print(
         f"[export_rvq][rvq] start total_items={total_items} stages={int(num_stages)} "
-        f"codebook_size={int(codebook_size)} batch_size={int(batch_size)}"
+        f"codebook_size={int(codebook_size)} batch_size={int(batch_size)} fit_items={fit_items}"
     )
+    fit_residual = residual if fit_indices is None else residual[fit_indices].copy()
     for stage_idx in range(int(num_stages)):
         stage_start = time.perf_counter()
         kmeans = MiniBatchKMeans(
@@ -225,8 +234,8 @@ def _perform_rvq(
             random_state=int(seed) + stage_idx,
             n_init="auto",
         )
-        print(f"[export_rvq][rvq] stage={stage_idx + 1}/{int(num_stages)} fit")
-        kmeans.fit(residual)
+        print(f"[export_rvq][rvq] stage={stage_idx + 1}/{int(num_stages)} fit fit_items={fit_items}")
+        kmeans.fit(fit_residual)
         print(f"[export_rvq][rvq] stage={stage_idx + 1}/{int(num_stages)} assign")
         stage_codes = kmeans.predict(residual).astype(np.int32, copy=False)
         stage_centers = kmeans.cluster_centers_.astype(np.float32, copy=False)
@@ -234,6 +243,10 @@ def _perform_rvq(
         codes[:, stage_idx] = stage_codes
         codebooks.append(stage_centers)
         residual = residual - quantized
+        if fit_indices is not None:
+            fit_residual = residual[fit_indices].copy()
+        else:
+            fit_residual = residual
         residual_norm = float(np.linalg.norm(residual) / max(total_items, 1))
         print(
             f"[export_rvq][rvq] stage={stage_idx + 1}/{int(num_stages)} done "
@@ -347,11 +360,17 @@ def export_pairs(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]
         f"max_items={dataset_cfg.get('max_items')} pca_dim={int(rvq_cfg['pca_dim'])} "
         f"stages={int(rvq_cfg['num_stages'])} codebook_size={int(rvq_cfg['codebook_size'])}"
     )
+    pca_fit_max_items = rvq_cfg.get("pca_fit_max_items")
+    rvq_fit_max_items = rvq_cfg.get("rvq_fit_max_items")
     ipca = _fit_incremental_pca(
         image_manifest,
         pca_dim=int(rvq_cfg["pca_dim"]),
         batch_size=int(rvq_cfg.get("batch_size", 512)),
-        max_items=dataset_cfg.get("max_items"),
+        max_items=(
+            int(pca_fit_max_items)
+            if pca_fit_max_items is not None
+            else dataset_cfg.get("max_items")
+        ),
         channel_mode=str(dataset_cfg.get("channel_mode", "keep")),
     )
     features, labels, sample_ids = _project_dataset(
@@ -367,6 +386,7 @@ def export_pairs(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]
         codebook_size=int(rvq_cfg["codebook_size"]),
         batch_size=int(rvq_cfg.get("batch_size", 512)),
         seed=int(runtime_cfg.get("seed", 42)),
+        fit_max_items=None if rvq_fit_max_items is None else int(rvq_fit_max_items),
     )
     output_manifest = _resolve_path(export_cfg["output_manifest_path"], config_dir=config_dir, repo_root=repo_root)
     result = _save_rvq_shards(

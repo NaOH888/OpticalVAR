@@ -70,6 +70,8 @@ class ExportRVQPairsTests(unittest.TestCase):
                     "num_stages": 2,
                     "codebook_size": 3,
                     "batch_size": 4,
+                    "pca_fit_max_items": 4,
+                    "rvq_fit_max_items": 4,
                 },
                 "export": {
                     "shard_size": 4,

@@ -13,7 +13,9 @@
     "pca_dim": 256,
     "num_stages": 4,
     "codebook_size": 256,
-    "batch_size": 512
+    "batch_size": 512,
+    "pca_fit_max_items": 12000,
+    "rvq_fit_max_items": 12000
   },
   "export": {
     "shard_size": 4096,
