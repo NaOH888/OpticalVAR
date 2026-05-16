@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from optical.data import MultiScaleFrequencyTargetTransform
+from vae import PerceptualLoss
 
 
 class OpticalMultiscaleLoss(nn.Module):
@@ -29,6 +30,8 @@ class OpticalMultiscaleLoss(nn.Module):
         tv_weight: float = 0.0,
         background_weight: float = 0.0,
         background_threshold: float = 0.05,
+        perceptual_weight: float = 0.0,
+        perceptual_loss_fn: PerceptualLoss | None = None,
         loss_type: Literal["mse", "l1"] = "mse",
         band_mode: Literal["prefix_difference", "frequency_transform"] = "prefix_difference",
         level_weights: Sequence[float] | None = None,
@@ -52,6 +55,8 @@ class OpticalMultiscaleLoss(nn.Module):
         self.tv_weight = float(tv_weight)
         self.background_weight = float(background_weight)
         self.background_threshold = float(background_threshold)
+        self.perceptual_weight = float(perceptual_weight)
+        self.perceptual_loss_fn = perceptual_loss_fn
         self.loss_type = loss_type
         self.band_mode = band_mode
         self.band_transform = band_transform
@@ -67,6 +72,8 @@ class OpticalMultiscaleLoss(nn.Module):
             and self.band_transform is None
         ):
             self.band_transform = MultiScaleFrequencyTargetTransform(num_levels=self.num_levels)
+        if self.perceptual_weight != 0.0 and self.perceptual_loss_fn is None:
+            raise ValueError("perceptual_loss_fn must be provided when perceptual_weight is non-zero")
 
     def _validate_level_weights(self, level_weights: Sequence[float]) -> tuple[float, ...]:
         weights = tuple(float(value) for value in level_weights)
@@ -249,8 +256,17 @@ class OpticalMultiscaleLoss(nn.Module):
             if self.background_weight != 0.0
             else final_loss.new_zeros(())
         )
+        perceptual_loss = (
+            self.perceptual_loss_fn(
+                final_prediction.unsqueeze(1),
+                final_target.unsqueeze(1),
+            )
+            if self.perceptual_weight != 0.0 and self.perceptual_loss_fn is not None
+            else final_loss.new_zeros(())
+        )
         total = total + self.tv_weight * tv_loss
         total = total + self.background_weight * background_loss
+        total = total + self.perceptual_weight * perceptual_loss
         scale_loss_mean = torch.stack(scale_losses).mean() if scale_losses else final_loss.new_zeros(())
         if band_losses:
             band_loss_mean = torch.stack(band_losses).mean()
@@ -264,6 +280,7 @@ class OpticalMultiscaleLoss(nn.Module):
             "band_loss": band_loss_mean,
             "tv_loss": tv_loss,
             "background_loss": background_loss,
+            "perceptual_loss": perceptual_loss,
             "scale_losses": tuple(scale_losses),
             "band_losses": tuple(band_losses),
         }

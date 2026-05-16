@@ -22,6 +22,7 @@ from optical.data import FrequencyPathDataset, MultiScaleFrequencyTargetTransfor
 from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.losses import OpticalMultiscaleLoss
 from optical.models import LatentPhaseMapEncoder, OpticalMultiscaleModel, OpticalPrefixReadoutDecoder, PhaseMapEncoder
+from vae import build_perceptual_loss
 
 
 def _load_config(config_path: Path) -> dict[str, Any]:
@@ -380,11 +381,21 @@ def _build_loss(
     config: dict[str, Any],
     *,
     multiscale_transform: MultiScaleFrequencyTargetTransform,
+    device: torch.device,
 ) -> OpticalMultiscaleLoss:
     loss_cfg = dict(config["loss"])
     num_levels = int(config["multiscale"]["num_levels"])
     band_mode = str(loss_cfg.get("band_mode", "prefix_difference"))
     band_transform = multiscale_transform if band_mode == "frequency_transform" else None
+    perceptual_loss_fn = build_perceptual_loss(
+        {
+            "perceptual_weight": float(loss_cfg.get("perceptual_weight", 0.0)),
+            "perceptual_weights": loss_cfg.get("perceptual_weights", "imagenet"),
+            "perceptual_feature_layers": loss_cfg.get("perceptual_feature_layers", [3, 8, 15, 22]),
+        }
+    )
+    if perceptual_loss_fn is not None:
+        perceptual_loss_fn = perceptual_loss_fn.to(device)
     return OpticalMultiscaleLoss(
         num_levels=num_levels,
         final_weight=float(loss_cfg.get("final_weight", 1.0)),
@@ -393,6 +404,8 @@ def _build_loss(
         tv_weight=float(loss_cfg.get("tv_weight", 0.0)),
         background_weight=float(loss_cfg.get("background_weight", 0.0)),
         background_threshold=float(loss_cfg.get("background_threshold", 0.05)),
+        perceptual_weight=float(loss_cfg.get("perceptual_weight", 0.0)),
+        perceptual_loss_fn=perceptual_loss_fn,
         loss_type=str(loss_cfg.get("loss_type", "mse")),
         band_mode=band_mode,
         level_weights=loss_cfg.get("level_weights"),
@@ -456,7 +469,7 @@ def _resolve_level_weight_schedule(
     if period_epochs <= 0:
         raise ValueError("training.level_weight_schedule.period_epochs must be positive")
 
-    phase = math.pi * float(epoch_idx) / float(period_epochs)
+    phase = 2.0 * math.pi * float(epoch_idx) / float(period_epochs)
     offset = amplitude * math.cos(phase)
     weights = [base_weight + offset * position for base_weight, position in zip(base_weights, positions)]
 
@@ -620,7 +633,7 @@ def train(
     )
     sample_item = dataset[0]
     model = _build_model(config, sample_item=sample_item).to(device)
-    criterion = _build_loss(config, multiscale_transform=multiscale_transform)
+    criterion = _build_loss(config, multiscale_transform=multiscale_transform, device=device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=float(train_cfg.get("lr", 1.0e-3)),
@@ -681,6 +694,7 @@ def train(
         running_band = 0.0
         running_tv = 0.0
         running_background = 0.0
+        running_perceptual = 0.0
         step_count = 0
 
         for step_idx, batch in enumerate(loader, start=1):
@@ -705,6 +719,7 @@ def train(
             running_band += float(loss_output["band_loss"].detach().cpu())
             running_tv += float(loss_output["tv_loss"].detach().cpu())
             running_background += float(loss_output["background_loss"].detach().cpu())
+            running_perceptual += float(loss_output["perceptual_loss"].detach().cpu())
             step_count += 1
 
             if step_idx % log_interval == 0:
@@ -715,7 +730,8 @@ def train(
                     f"scale={running_scale / step_count:.6f} "
                     f"band={running_band / step_count:.6f} "
                     f"tv={running_tv / step_count:.6f} "
-                    f"bg={running_background / step_count:.6f}"
+                    f"bg={running_background / step_count:.6f} "
+                    f"perc={running_perceptual / step_count:.6f}"
                 )
 
             if max_steps_per_epoch is not None and step_idx >= int(max_steps_per_epoch):
@@ -732,6 +748,7 @@ def train(
             "band_loss": running_band / step_count,
             "tv_loss": running_tv / step_count,
             "background_loss": running_background / step_count,
+            "perceptual_loss": running_perceptual / step_count,
             "level_weights": list(criterion.level_weights),
         }
         print(
@@ -742,6 +759,7 @@ def train(
             f"band={latest_metrics['band_loss']:.6f} "
             f"tv={latest_metrics['tv_loss']:.6f} "
             f"bg={latest_metrics['background_loss']:.6f} "
+            f"perc={latest_metrics['perceptual_loss']:.6f} "
             f"level_weights={latest_metrics['level_weights']}"
         )
         _append_jsonl(history_path, latest_metrics)

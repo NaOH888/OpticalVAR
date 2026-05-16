@@ -13,6 +13,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from optical.data import MultiScaleFrequencyTargetTransform
 from optical.losses import OpticalMultiscaleLoss
+from vae import build_perceptual_loss
 
 
 class OpticalMultiscaleLossTests(unittest.TestCase):
@@ -166,6 +167,37 @@ class OpticalMultiscaleLossTests(unittest.TestCase):
         losses = criterion(outputs, targets)
 
         self.assertGreater(float(losses["background_loss"]), 0.0)
+        self.assertGreater(float(losses["total_loss"]), float(losses["final_loss"]))
+
+    def test_perceptual_loss_is_reported_when_enabled(self) -> None:
+        image = torch.rand((1, 32, 32), dtype=torch.float32)
+        outputs = {
+            "final_detector": image.unsqueeze(1).clone(),
+            "prefix_readout_1": image.unsqueeze(1),
+        }
+        targets = {
+            "target_final": torch.zeros_like(image),
+            "target_scale_1": image,
+            "target_band_1": image,
+        }
+        criterion = OpticalMultiscaleLoss(
+            num_levels=1,
+            final_weight=1.0,
+            scale_weight=0.0,
+            band_weight=0.0,
+            perceptual_weight=0.1,
+            perceptual_loss_fn=build_perceptual_loss(
+                {
+                    "perceptual_weight": 0.1,
+                    "perceptual_weights": "none",
+                    "perceptual_feature_layers": [3],
+                }
+            ),
+        )
+
+        losses = criterion(outputs, targets)
+
+        self.assertGreaterEqual(float(losses["perceptual_loss"]), 0.0)
         self.assertGreater(float(losses["total_loss"]), float(losses["final_loss"]))
 
     def test_level_weights_can_be_updated_after_construction(self) -> None:

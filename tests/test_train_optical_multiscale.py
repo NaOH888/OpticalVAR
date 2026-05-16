@@ -25,7 +25,13 @@ from scripts.train_optical_multiscale import (
 
 
 class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
-    def _write_tiny_training_case(self, tmp_path: Path) -> tuple[Path, Path, Path]:
+    def _write_tiny_training_case(
+        self,
+        tmp_path: Path,
+        *,
+        image_size: int = 8,
+        phase_grid_size: int = 4,
+    ) -> tuple[Path, Path, Path]:
         dataset_dir = tmp_path / "dataset"
         dataset_dir.mkdir(parents=True, exist_ok=True)
         npz_path = dataset_dir / "tiny_fashion.npz"
@@ -33,7 +39,12 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
         outputs_dir = tmp_path / "outputs"
         config_path = tmp_path / "train_config.json"
 
-        images = np.linspace(0.0, 1.0, num=4 * 3 * 8 * 8, dtype=np.float32).reshape(4, 3, 8, 8)
+        images = np.linspace(
+            0.0,
+            1.0,
+            num=4 * 3 * image_size * image_size,
+            dtype=np.float32,
+        ).reshape(4, 3, image_size, image_size)
         labels = np.array([0, 1, 2, 3], dtype=np.int64)
         np.savez(npz_path, images=images, labels=labels)
         manifest_path.write_text(
@@ -67,10 +78,10 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
                         "latent_embed_dim": 24,
                         "condition_embed_dim": 12,
                         "fused_dim": 20,
-                        "input_height": 8,
-                        "input_width": 8,
-                        "output_height": 8,
-                        "output_width": 8,
+                        "input_height": image_size,
+                        "input_width": image_size,
+                        "output_height": image_size,
+                        "output_width": image_size,
                         "phase_alpha_pi": 2.0,
                         "class_conditional": True,
                         "num_classes": 10,
@@ -89,8 +100,8 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
                         "slm": {
                             "pixel_pitch_x_m": 1.0e-6,
                             "pixel_pitch_y_m": 1.0e-6,
-                            "pixel_count_x": 8,
-                            "pixel_count_y": 8,
+                            "pixel_count_x": image_size,
+                            "pixel_count_y": image_size,
                             "dx_m": 1.0e-6,
                             "fill_factor": 1.0,
                             "phase_alpha": 2.0,
@@ -103,12 +114,12 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
                             "initial_phase_value_rad": 0.0,
                             "init_min_rad": 0.0,
                             "init_max_rad": 2.0,
-                            "phase_grid_height": 4,
-                            "phase_grid_width": 4
+                            "phase_grid_height": phase_grid_size,
+                            "phase_grid_width": phase_grid_size
                         },
                         "detector": {
-                            "width_num": 8,
-                            "height_num": 8,
+                            "width_num": image_size,
+                            "height_num": image_size,
                             "detector_unit_len_m": 1.0e-6
                         },
                         "propagation": {
@@ -361,23 +372,45 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             tmp_path = Path(tmp_dir)
             _, outputs_dir, config_path = self._write_tiny_training_case(tmp_path)
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["training"]["epochs"] = 2
+            config["training"]["epochs"] = 3
             config["training"]["level_weight_schedule"] = {
                 "mode": "swing",
                 "base_weights": [2.0, 2.0],
                 "amplitude": 0.5,
-                "period_epochs": 1,
+                "period_epochs": 2,
             }
 
             result = train(config, config_path=config_path)
 
             history_lines = (outputs_dir / "history.jsonl").read_text(encoding="utf-8").strip().splitlines()
-            self.assertEqual(len(history_lines), 2)
+            self.assertEqual(len(history_lines), 3)
             first_payload = json.loads(history_lines[0])
             second_payload = json.loads(history_lines[1])
+            third_payload = json.loads(history_lines[2])
             self.assertEqual(first_payload["level_weights"], [2.25, 1.75])
             self.assertEqual(second_payload["level_weights"], [1.75, 2.25])
-            self.assertEqual(result["metrics"]["level_weights"], [1.75, 2.25])
+            self.assertEqual(third_payload["level_weights"], [2.25, 1.75])
+            self.assertEqual(result["metrics"]["level_weights"], [2.25, 1.75])
+
+    def test_training_logs_perceptual_loss_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, outputs_dir, config_path = self._write_tiny_training_case(
+                tmp_path,
+                image_size=32,
+                phase_grid_size=16,
+            )
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["loss"]["perceptual_weight"] = 0.05
+            config["loss"]["perceptual_weights"] = "none"
+            config["loss"]["perceptual_feature_layers"] = [3]
+
+            result = train(config, config_path=config_path)
+
+            self.assertIn("perceptual_loss", result["metrics"])
+            history_lines = (outputs_dir / "history.jsonl").read_text(encoding="utf-8").strip().splitlines()
+            payload = json.loads(history_lines[-1])
+            self.assertIn("perceptual_loss", payload)
 
 if __name__ == "__main__":
     unittest.main()
