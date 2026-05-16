@@ -380,6 +380,122 @@ class LatentPhaseMapEncoder(nn.Module):
         return self.phase_map_encoder(fused_repr)
 
 
+class DigitalPrefixReadoutDecoder(nn.Module):
+    """Purely digital decoder that maps the SLM-sized phase map to multiscale readouts."""
+
+    def __init__(
+        self,
+        *,
+        input_height: int,
+        input_width: int,
+        output_height: int,
+        output_width: int,
+        num_levels: int,
+        hidden_channels: Sequence[int] = (32, 64, 64),
+        output_activation: str = "sigmoid",
+        upsample_mode: str = "bilinear",
+    ) -> None:
+        super().__init__()
+        self.input_height = int(input_height)
+        self.input_width = int(input_width)
+        self.output_height = int(output_height)
+        self.output_width = int(output_width)
+        self.num_levels = int(num_levels)
+        self.hidden_channels = tuple(int(value) for value in hidden_channels)
+        self.output_activation = str(output_activation)
+        self.upsample_mode = str(upsample_mode)
+
+        if self.input_height <= 0 or self.input_width <= 0:
+            raise ValueError("input_height and input_width must be positive")
+        if self.output_height <= 0 or self.output_width <= 0:
+            raise ValueError("output_height and output_width must be positive")
+        if self.num_levels <= 0:
+            raise ValueError(f"num_levels must be positive, got {num_levels!r}")
+        if len(self.hidden_channels) == 0:
+            raise ValueError("hidden_channels must contain at least one value")
+        if any(value <= 0 for value in self.hidden_channels):
+            raise ValueError(f"hidden_channels must be positive, got {hidden_channels!r}")
+        if self.output_activation not in {"sigmoid", "softplus", "identity"}:
+            raise ValueError(
+                "output_activation must be 'sigmoid', 'softplus', or 'identity', "
+                f"got {output_activation!r}"
+            )
+
+        layers: list[nn.Module] = []
+        in_channels = 1
+        for out_channels in self.hidden_channels:
+            layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
+            layers.append(nn.SiLU())
+            in_channels = out_channels
+        self.backbone = nn.Sequential(*layers)
+        self.head = nn.Conv2d(in_channels, self.num_levels, kernel_size=1)
+        self._reset_parameters()
+
+    @property
+    def slm_input_height(self) -> int:
+        return self.input_height
+
+    @property
+    def slm_input_width(self) -> int:
+        return self.input_width
+
+    @property
+    def num_prefix_readouts(self) -> int:
+        return self.num_levels
+
+    def _reset_parameters(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                init.kaiming_uniform_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    init.zeros_(module.bias)
+
+    def _apply_output_activation(self, readouts: torch.Tensor) -> torch.Tensor:
+        if self.output_activation == "sigmoid":
+            return torch.sigmoid(readouts)
+        if self.output_activation == "softplus":
+            return F.softplus(readouts)
+        return readouts
+
+    def forward(
+        self,
+        slm_input: torch.Tensor,
+        *,
+        error_factor: float | None = None,
+    ) -> dict[str, torch.Tensor | tuple[torch.Tensor, ...]]:
+        del error_factor
+        if slm_input.dim() != 4 or int(slm_input.shape[1]) != 1:
+            raise ValueError(f"slm_input must be [B,1,H,W], got {tuple(slm_input.shape)}")
+        if tuple(slm_input.shape[-2:]) != (self.input_height, self.input_width):
+            raise ValueError(
+                "slm_input spatial shape must match decoder input grid: "
+                f"expected={(self.input_height, self.input_width)}, "
+                f"got={tuple(slm_input.shape[-2:])}"
+            )
+
+        hidden = self.backbone(slm_input.to(dtype=torch.float32))
+        readout_stack = self.head(hidden)
+        if tuple(readout_stack.shape[-2:]) != (self.output_height, self.output_width):
+            align_corners = False if self.upsample_mode in {"bilinear", "bicubic"} else None
+            readout_stack = F.interpolate(
+                readout_stack,
+                size=(self.output_height, self.output_width),
+                mode=self.upsample_mode,
+                align_corners=align_corners,
+            )
+        readout_stack = self._apply_output_activation(readout_stack)
+        prefix_readouts = tuple(
+            readout_stack[:, index : index + 1] for index in range(self.num_levels)
+        )
+        output: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {
+            "prefix_readouts": prefix_readouts,
+            "final_detector": prefix_readouts[-1],
+        }
+        for index, readout in enumerate(prefix_readouts, start=1):
+            output[f"prefix_readout_{index}"] = readout
+        return output
+
+
 class OpticalPrefixReadoutDecoder(nn.Module):
     """Optical decoder that reads each prefix at the detector plane."""
 
@@ -488,7 +604,7 @@ class OpticalMultiscaleModel(nn.Module):
         self,
         *,
         encoder: nn.Module,
-        optical_decoder: OpticalPrefixReadoutDecoder,
+        optical_decoder: nn.Module,
         upsample_mode: str = "nearest",
     ) -> None:
         super().__init__()

@@ -21,7 +21,13 @@ from optical.core import DetectorConfig, PropagationConfig, PropagationErrorConf
 from optical.data import FrequencyPathDataset, MultiScaleFrequencyTargetTransform, NpzImageDataset, ReferencedImageLatentDataset
 from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.losses import OpticalMultiscaleLoss
-from optical.models import LatentPhaseMapEncoder, OpticalMultiscaleModel, OpticalPrefixReadoutDecoder, PhaseMapEncoder
+from optical.models import (
+    DigitalPrefixReadoutDecoder,
+    LatentPhaseMapEncoder,
+    OpticalMultiscaleModel,
+    OpticalPrefixReadoutDecoder,
+    PhaseMapEncoder,
+)
 from vae import build_perceptual_loss
 
 
@@ -201,7 +207,9 @@ def _build_model(
     multiscale_cfg = dict(config["multiscale"])
     optical_cfg = dict(config["optical"])
     encoder_cfg = dict(config["encoder"])
+    decoder_cfg = dict(config.get("decoder", {}))
     num_levels = int(multiscale_cfg["num_levels"])
+    decoder_backend = str(decoder_cfg.get("backend", "optical"))
 
     source_cfg = SourceConfig(
         wavelengths_m=tuple(float(value) for value in optical_cfg["source"]["wavelengths_m"]),
@@ -271,20 +279,34 @@ def _build_model(
         shift_y_m=float(optical_cfg["error"].get("shift_y_m", 0.0)),
     )
 
-    decoder = OpticalPrefixReadoutDecoder(
-        slm_layer=slm,
-        optical_layers=tuple(optical_layers),
-        detector_layer=detector,
-        distance_slm_to_first_layer_m=float(optical_cfg["distances_m"]["slm_to_first_layer_m"]),
-        distance_between_layers_m=_expand_between_layer_distances(
-            optical_cfg["distances_m"]["between_layers_m"],
+    if decoder_backend == "optical":
+        decoder = OpticalPrefixReadoutDecoder(
+            slm_layer=slm,
+            optical_layers=tuple(optical_layers),
+            detector_layer=detector,
+            distance_slm_to_first_layer_m=float(optical_cfg["distances_m"]["slm_to_first_layer_m"]),
+            distance_between_layers_m=_expand_between_layer_distances(
+                optical_cfg["distances_m"]["between_layers_m"],
+                num_levels=num_levels,
+            ),
+            distance_last_layer_to_detector_m=float(optical_cfg["distances_m"]["last_layer_to_detector_m"]),
+            propagation_config=propagation_cfg,
+            error_config=error_cfg,
+            default_error_factor=float(optical_cfg["error"].get("error_factor", 1.0)),
+        )
+    elif decoder_backend == "digital":
+        decoder = DigitalPrefixReadoutDecoder(
+            input_height=slm.pixel_count_y,
+            input_width=slm.pixel_count_x,
+            output_height=detector_cfg.height_num,
+            output_width=detector_cfg.width_num,
             num_levels=num_levels,
-        ),
-        distance_last_layer_to_detector_m=float(optical_cfg["distances_m"]["last_layer_to_detector_m"]),
-        propagation_config=propagation_cfg,
-        error_config=error_cfg,
-        default_error_factor=float(optical_cfg["error"].get("error_factor", 1.0)),
-    )
+            hidden_channels=tuple(int(v) for v in decoder_cfg.get("hidden_channels", [32, 64, 64])),
+            output_activation=str(decoder_cfg.get("output_activation", "sigmoid")),
+            upsample_mode=str(decoder_cfg.get("upsample_mode", "bilinear")),
+        )
+    else:
+        raise ValueError(f"Unsupported decoder backend: {decoder_backend!r}")
 
     latent_embed_dim = int(encoder_cfg.get("latent_embed_dim", encoder_cfg.get("hidden_dim", 512)))
     condition_embed_dim = int(encoder_cfg.get("condition_embed_dim", encoder_cfg.get("class_embed_dim", 128)))

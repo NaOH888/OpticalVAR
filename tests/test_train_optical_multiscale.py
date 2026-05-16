@@ -427,5 +427,23 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             payload = json.loads(history_lines[-1])
             self.assertIn("latent_diversity_loss", payload)
 
+    def test_script_runs_one_epoch_with_digital_decoder_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, outputs_dir, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["decoder"] = {
+                "backend": "digital",
+                "hidden_channels": [8, 16],
+                "output_activation": "sigmoid",
+            }
+
+            result = train(config, config_path=config_path)
+
+            self.assertTrue((outputs_dir / "latest.pt").exists())
+            self.assertIn("total_loss", result["metrics"])
+            checkpoint = torch.load(outputs_dir / "latest.pt", map_location="cpu", weights_only=False)
+            self.assertEqual(checkpoint["config"]["decoder"]["backend"], "digital")
+
 if __name__ == "__main__":
     unittest.main()

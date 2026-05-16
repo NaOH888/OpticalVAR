@@ -17,6 +17,7 @@ from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.models import (
     ConditionEmbeddingLayer,
     ConditionalPhaseSLMEncoder,
+    DigitalPrefixReadoutDecoder,
     LatentPhaseMapEncoder,
     OpticalMultiscaleModel,
     OpticalPrefixReadoutDecoder,
@@ -179,6 +180,26 @@ class OpticalMultiscaleModelTests(unittest.TestCase):
         )
         self.assertEqual(tuple(output.shape), (2, 1, 4, 4))
         self.assertTrue(torch.isfinite(output).all().item())
+
+    def test_digital_prefix_readout_decoder_returns_multiscale_images(self) -> None:
+        decoder = DigitalPrefixReadoutDecoder(
+            input_height=4,
+            input_width=4,
+            output_height=6,
+            output_width=6,
+            num_levels=3,
+            hidden_channels=(8, 16),
+            output_activation="sigmoid",
+        )
+
+        outputs = decoder(torch.zeros((2, 1, 4, 4), dtype=torch.float32))
+
+        self.assertEqual(tuple(outputs["prefix_readout_1"].shape), (2, 1, 6, 6))
+        self.assertEqual(tuple(outputs["prefix_readout_2"].shape), (2, 1, 6, 6))
+        self.assertEqual(tuple(outputs["prefix_readout_3"].shape), (2, 1, 6, 6))
+        self.assertEqual(tuple(outputs["final_detector"].shape), (2, 1, 6, 6))
+        self.assertEqual(len(outputs["prefix_readouts"]), 3)
+        self.assertTrue(torch.allclose(outputs["prefix_readout_3"], outputs["final_detector"]))
 
     def test_prefix_readout_decoder_returns_detector_plane_prefixes(self) -> None:
         source_config = SourceConfig(
