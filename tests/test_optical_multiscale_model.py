@@ -17,7 +17,7 @@ from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.models import (
     ConditionEmbeddingLayer,
     ConditionalPhaseSLMEncoder,
-    DigitalPrefixReadoutDecoder,
+    HierarchicalRVQPhaseMapEncoder,
     LatentPhaseMapEncoder,
     OpticalMultiscaleModel,
     OpticalPrefixReadoutDecoder,
@@ -181,25 +181,33 @@ class OpticalMultiscaleModelTests(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (2, 1, 4, 4))
         self.assertTrue(torch.isfinite(output).all().item())
 
-    def test_digital_prefix_readout_decoder_returns_multiscale_images(self) -> None:
-        decoder = DigitalPrefixReadoutDecoder(
-            input_height=4,
-            input_width=4,
-            output_height=6,
-            output_width=6,
-            num_levels=3,
-            hidden_channels=(8, 16),
-            output_activation="sigmoid",
+    def test_hierarchical_rvq_phase_map_encoder_builds_multiscale_phase(self) -> None:
+        encoder = HierarchicalRVQPhaseMapEncoder(
+            num_codebooks=4,
+            codebook_size=16,
+            code_embed_dim=8,
+            output_height=176,
+            output_width=176,
+            condition_layer=ConditionEmbeddingLayer(
+                mode="attribute_vector",
+                input_dim=5,
+                output_dim=10,
+                hidden_dim=12,
+            ),
+            stage_hidden_dim=16,
+            stage_fusion_hidden_dim=24,
+            phase_alpha_pi=2.0,
         )
 
-        outputs = decoder(torch.zeros((2, 1, 4, 4), dtype=torch.float32))
+        output = encoder(
+            torch.tensor([[1, 2, 3, 4], [0, 5, 7, 9]], dtype=torch.long),
+            condition=torch.tensor([[1, 0, 1, 0, 1], [0, 1, 0, 1, 0]], dtype=torch.float32),
+        )
 
-        self.assertEqual(tuple(outputs["prefix_readout_1"].shape), (2, 1, 6, 6))
-        self.assertEqual(tuple(outputs["prefix_readout_2"].shape), (2, 1, 6, 6))
-        self.assertEqual(tuple(outputs["prefix_readout_3"].shape), (2, 1, 6, 6))
-        self.assertEqual(tuple(outputs["final_detector"].shape), (2, 1, 6, 6))
-        self.assertEqual(len(outputs["prefix_readouts"]), 3)
-        self.assertTrue(torch.allclose(outputs["prefix_readout_3"], outputs["final_detector"]))
+        self.assertEqual(tuple(output.shape), (2, 1, 176, 176))
+        self.assertTrue(torch.isfinite(output).all().item())
+        self.assertTrue(torch.all(output >= 0.0).item())
+        self.assertTrue(torch.all(output < encoder.phase_period_rad).item())
 
     def test_prefix_readout_decoder_returns_detector_plane_prefixes(self) -> None:
         source_config = SourceConfig(

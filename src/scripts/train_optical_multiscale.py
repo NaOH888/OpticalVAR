@@ -16,13 +16,13 @@ if __package__ in {None, ""}:
     if str(SRC_ROOT) not in sys.path:
         sys.path.insert(0, str(SRC_ROOT))
 
-from conditioning import ConditionEmbeddingLayer, ConditionalLatentFusion, ContinuousMapLatentProjector, DiscreteCodeLatentProjector, LatentEmbeddingLayer
+from conditioning import ConditionEmbeddingLayer, ConditionalLatentFusion, ContinuousMapLatentProjector, LatentEmbeddingLayer
 from optical.core import DetectorConfig, PropagationConfig, PropagationErrorConfig, SourceConfig
 from optical.data import FrequencyPathDataset, MultiScaleFrequencyTargetTransform, NpzImageDataset, ReferencedImageLatentDataset
 from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.losses import OpticalMultiscaleLoss
 from optical.models import (
-    DigitalPrefixReadoutDecoder,
+    HierarchicalRVQPhaseMapEncoder,
     LatentPhaseMapEncoder,
     OpticalMultiscaleModel,
     OpticalPrefixReadoutDecoder,
@@ -207,9 +207,7 @@ def _build_model(
     multiscale_cfg = dict(config["multiscale"])
     optical_cfg = dict(config["optical"])
     encoder_cfg = dict(config["encoder"])
-    decoder_cfg = dict(config.get("decoder", {}))
     num_levels = int(multiscale_cfg["num_levels"])
-    decoder_backend = str(decoder_cfg.get("backend", "optical"))
 
     source_cfg = SourceConfig(
         wavelengths_m=tuple(float(value) for value in optical_cfg["source"]["wavelengths_m"]),
@@ -279,34 +277,20 @@ def _build_model(
         shift_y_m=float(optical_cfg["error"].get("shift_y_m", 0.0)),
     )
 
-    if decoder_backend == "optical":
-        decoder = OpticalPrefixReadoutDecoder(
-            slm_layer=slm,
-            optical_layers=tuple(optical_layers),
-            detector_layer=detector,
-            distance_slm_to_first_layer_m=float(optical_cfg["distances_m"]["slm_to_first_layer_m"]),
-            distance_between_layers_m=_expand_between_layer_distances(
-                optical_cfg["distances_m"]["between_layers_m"],
-                num_levels=num_levels,
-            ),
-            distance_last_layer_to_detector_m=float(optical_cfg["distances_m"]["last_layer_to_detector_m"]),
-            propagation_config=propagation_cfg,
-            error_config=error_cfg,
-            default_error_factor=float(optical_cfg["error"].get("error_factor", 1.0)),
-        )
-    elif decoder_backend == "digital":
-        decoder = DigitalPrefixReadoutDecoder(
-            input_height=slm.pixel_count_y,
-            input_width=slm.pixel_count_x,
-            output_height=detector_cfg.height_num,
-            output_width=detector_cfg.width_num,
+    decoder = OpticalPrefixReadoutDecoder(
+        slm_layer=slm,
+        optical_layers=tuple(optical_layers),
+        detector_layer=detector,
+        distance_slm_to_first_layer_m=float(optical_cfg["distances_m"]["slm_to_first_layer_m"]),
+        distance_between_layers_m=_expand_between_layer_distances(
+            optical_cfg["distances_m"]["between_layers_m"],
             num_levels=num_levels,
-            hidden_channels=tuple(int(v) for v in decoder_cfg.get("hidden_channels", [32, 64, 64])),
-            output_activation=str(decoder_cfg.get("output_activation", "sigmoid")),
-            upsample_mode=str(decoder_cfg.get("upsample_mode", "bilinear")),
-        )
-    else:
-        raise ValueError(f"Unsupported decoder backend: {decoder_backend!r}")
+        ),
+        distance_last_layer_to_detector_m=float(optical_cfg["distances_m"]["last_layer_to_detector_m"]),
+        propagation_config=propagation_cfg,
+        error_config=error_cfg,
+        default_error_factor=float(optical_cfg["error"].get("error_factor", 1.0)),
+    )
 
     latent_embed_dim = int(encoder_cfg.get("latent_embed_dim", encoder_cfg.get("hidden_dim", 512)))
     condition_embed_dim = int(encoder_cfg.get("condition_embed_dim", encoder_cfg.get("class_embed_dim", 128)))
@@ -316,47 +300,11 @@ def _build_model(
     condition_mode = encoder_cfg.get("condition_mode")
     class_conditional = bool(encoder_cfg.get("class_conditional", False))
 
-    if "latent" in sample_item:
-        sample_latent = sample_item["latent"]
-        if not isinstance(sample_latent, torch.Tensor):
-            sample_latent = torch.as_tensor(sample_latent)
-        if sample_latent.dtype in {
-            torch.int8,
-            torch.int16,
-            torch.int32,
-            torch.int64,
-            torch.uint8,
-        }:
-            discrete_shape = sample_latent.reshape(-1).shape[0]
-            codebook_size = encoder_cfg.get("rvq_codebook_size")
-            if codebook_size is None:
-                raise ValueError("encoder.rvq_codebook_size must be provided for discrete latent inputs")
-            latent_projector = DiscreteCodeLatentProjector(
-                num_codebooks=discrete_shape,
-                codebook_size=int(codebook_size),
-                code_embed_dim=int(encoder_cfg.get("rvq_code_embed_dim", latent_embed_dim)),
-                output_dim=latent_embed_dim,
-                hidden_dim=encoder_cfg.get("latent_hidden_dim"),
-                fuse_codebooks=str(encoder_cfg.get("rvq_fuse_codebooks", "sum")),
-            )
-        else:
-            latent_shape = tuple(int(v) for v in sample_latent.shape)
-            latent_projector = ContinuousMapLatentProjector(
-                input_dim=int(torch.as_tensor(latent_shape).prod().item()),
-                output_dim=latent_embed_dim,
-                hidden_dim=encoder_cfg.get("latent_hidden_dim"),
-            )
-    else:
-        latent_projector = ContinuousMapLatentProjector(
-            input_dim=int(encoder_cfg.get("noise_channels", 1))
-            * int(encoder_cfg.get("input_height", sample_item["target_final"].shape[-2]))
-            * int(encoder_cfg.get("input_width", sample_item["target_final"].shape[-1])),
-            output_dim=latent_embed_dim,
-            hidden_dim=encoder_cfg.get("latent_hidden_dim"),
-        )
+    sample_latent = sample_item.get("latent")
+    if sample_latent is not None and not isinstance(sample_latent, torch.Tensor):
+        sample_latent = torch.as_tensor(sample_latent)
 
     condition_layer = None
-    fusion_layer = None
     if condition_mode is not None or class_conditional:
         resolved_condition_mode = "class_index" if condition_mode is None else str(condition_mode)
         condition_layer = ConditionEmbeddingLayer(
@@ -367,31 +315,73 @@ def _build_model(
             embed_dim=int(encoder_cfg.get("class_embed_dim", 128)),
             hidden_dim=encoder_cfg.get("condition_hidden_dim"),
         )
-        fusion_layer = ConditionalLatentFusion(
-            latent_dim=latent_embed_dim,
-            condition_dim=condition_embed_dim,
-            output_dim=fused_dim,
-            mode=fusion_mode,
-            hidden_dim=fusion_hidden_dim,
-        )
-        phase_input_dim = fused_dim
-    else:
-        phase_input_dim = latent_embed_dim
 
-    encoder = LatentPhaseMapEncoder(
-        latent_layer=LatentEmbeddingLayer(projector=latent_projector),
-        condition_layer=condition_layer,
-        fusion_layer=fusion_layer,
-        phase_map_encoder=PhaseMapEncoder(
-            input_dim=phase_input_dim,
+    if sample_latent is not None and sample_latent.dtype in {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }:
+        discrete_shape = sample_latent.reshape(-1).shape[0]
+        codebook_size = encoder_cfg.get("rvq_codebook_size")
+        if codebook_size is None:
+            raise ValueError("encoder.rvq_codebook_size must be provided for discrete latent inputs")
+        encoder = HierarchicalRVQPhaseMapEncoder(
+            num_codebooks=discrete_shape,
+            codebook_size=int(codebook_size),
+            code_embed_dim=int(encoder_cfg.get("rvq_code_embed_dim", 128)),
             output_height=int(encoder_cfg.get("output_height", slm.pixel_count_y)),
             output_width=int(encoder_cfg.get("output_width", slm.pixel_count_x)),
-            hidden_dim=int(encoder_cfg.get("hidden_dim", 512)),
+            condition_layer=condition_layer,
+            stage_hidden_dim=int(encoder_cfg.get("hidden_dim", 512)),
+            stage_fusion_hidden_dim=encoder_cfg.get("fusion_hidden_dim"),
+            upsample_mode="bilinear",
             phase_alpha_pi=float(encoder_cfg.get("phase_alpha_pi", 2.0)),
-            weight_init=str(encoder_cfg.get("weight_init", "kaiming_uniform")),
             output_weight_init=str(encoder_cfg.get("output_weight_init", "xavier_uniform")),
-        ),
-    )
+        )
+    else:
+        fusion_layer = None
+        if condition_layer is not None:
+            fusion_layer = ConditionalLatentFusion(
+                latent_dim=latent_embed_dim,
+                condition_dim=condition_embed_dim,
+                output_dim=fused_dim,
+                mode=fusion_mode,
+                hidden_dim=fusion_hidden_dim,
+            )
+            phase_input_dim = fused_dim
+        else:
+            phase_input_dim = latent_embed_dim
+        if sample_latent is not None:
+            latent_shape = tuple(int(v) for v in sample_latent.shape)
+            latent_projector = ContinuousMapLatentProjector(
+                input_dim=int(torch.as_tensor(latent_shape).prod().item()),
+                output_dim=latent_embed_dim,
+                hidden_dim=encoder_cfg.get("latent_hidden_dim"),
+            )
+        else:
+            latent_projector = ContinuousMapLatentProjector(
+                input_dim=int(encoder_cfg.get("noise_channels", 1))
+                * int(encoder_cfg.get("input_height", sample_item["target_final"].shape[-2]))
+                * int(encoder_cfg.get("input_width", sample_item["target_final"].shape[-1])),
+                output_dim=latent_embed_dim,
+                hidden_dim=encoder_cfg.get("latent_hidden_dim"),
+            )
+        encoder = LatentPhaseMapEncoder(
+            latent_layer=LatentEmbeddingLayer(projector=latent_projector),
+            condition_layer=condition_layer,
+            fusion_layer=fusion_layer,
+            phase_map_encoder=PhaseMapEncoder(
+                input_dim=phase_input_dim,
+                output_height=int(encoder_cfg.get("output_height", slm.pixel_count_y)),
+                output_width=int(encoder_cfg.get("output_width", slm.pixel_count_x)),
+                hidden_dim=int(encoder_cfg.get("hidden_dim", 512)),
+                phase_alpha_pi=float(encoder_cfg.get("phase_alpha_pi", 2.0)),
+                weight_init=str(encoder_cfg.get("weight_init", "kaiming_uniform")),
+                output_weight_init=str(encoder_cfg.get("output_weight_init", "xavier_uniform")),
+            ),
+        )
     return OpticalMultiscaleModel(
         encoder=encoder,
         optical_decoder=decoder,

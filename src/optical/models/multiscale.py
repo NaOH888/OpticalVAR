@@ -380,120 +380,191 @@ class LatentPhaseMapEncoder(nn.Module):
         return self.phase_map_encoder(fused_repr)
 
 
-class DigitalPrefixReadoutDecoder(nn.Module):
-    """Purely digital decoder that maps the SLM-sized phase map to multiscale readouts."""
+class HierarchicalRVQPhaseMapEncoder(nn.Module):
+    """使用分层 RVQ code 和条件向量共同生成多尺度相位分量，并融合成最终相位图。"""
 
     def __init__(
         self,
         *,
-        input_height: int,
-        input_width: int,
+        num_codebooks: int,
+        codebook_size: int,
+        code_embed_dim: int,
         output_height: int,
         output_width: int,
-        num_levels: int,
-        hidden_channels: Sequence[int] = (32, 64, 64),
-        output_activation: str = "sigmoid",
+        condition_layer: ConditionEmbeddingLayer | None = None,
+        stage_hidden_dim: int = 512,
+        stage_fusion_hidden_dim: int | None = None,
         upsample_mode: str = "bilinear",
+        phase_alpha_pi: float = 2.0,
+        output_weight_init: str = "xavier_uniform",
     ) -> None:
         super().__init__()
-        self.input_height = int(input_height)
-        self.input_width = int(input_width)
+        self.num_codebooks = int(num_codebooks)
+        self.codebook_size = int(codebook_size)
+        self.code_embed_dim = int(code_embed_dim)
         self.output_height = int(output_height)
         self.output_width = int(output_width)
-        self.num_levels = int(num_levels)
-        self.hidden_channels = tuple(int(value) for value in hidden_channels)
-        self.output_activation = str(output_activation)
+        self.condition_layer = condition_layer
+        self.stage_hidden_dim = int(stage_hidden_dim)
+        self.stage_fusion_hidden_dim = int(
+            stage_fusion_hidden_dim if stage_fusion_hidden_dim is not None else self.stage_hidden_dim
+        )
         self.upsample_mode = str(upsample_mode)
+        self.phase_alpha_pi = float(phase_alpha_pi)
+        self.output_weight_init = str(output_weight_init)
 
-        if self.input_height <= 0 or self.input_width <= 0:
-            raise ValueError("input_height and input_width must be positive")
+        if self.num_codebooks <= 0:
+            raise ValueError(f"num_codebooks must be positive, got {num_codebooks!r}")
+        if self.codebook_size <= 0:
+            raise ValueError(f"codebook_size must be positive, got {codebook_size!r}")
+        if self.code_embed_dim <= 0:
+            raise ValueError(f"code_embed_dim must be positive, got {code_embed_dim!r}")
         if self.output_height <= 0 or self.output_width <= 0:
             raise ValueError("output_height and output_width must be positive")
-        if self.num_levels <= 0:
-            raise ValueError(f"num_levels must be positive, got {num_levels!r}")
-        if len(self.hidden_channels) == 0:
-            raise ValueError("hidden_channels must contain at least one value")
-        if any(value <= 0 for value in self.hidden_channels):
-            raise ValueError(f"hidden_channels must be positive, got {hidden_channels!r}")
-        if self.output_activation not in {"sigmoid", "softplus", "identity"}:
-            raise ValueError(
-                "output_activation must be 'sigmoid', 'softplus', or 'identity', "
-                f"got {output_activation!r}"
-            )
+        if self.stage_hidden_dim <= 0 or self.stage_fusion_hidden_dim <= 0:
+            raise ValueError("stage hidden dimensions must be positive")
 
-        layers: list[nn.Module] = []
-        in_channels = 1
-        for out_channels in self.hidden_channels:
-            layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
-            layers.append(nn.SiLU())
-            in_channels = out_channels
-        self.backbone = nn.Sequential(*layers)
-        self.head = nn.Conv2d(in_channels, self.num_levels, kernel_size=1)
+        self.stage_sizes = self._build_stage_sizes(
+            output_height=self.output_height,
+            output_width=self.output_width,
+            num_codebooks=self.num_codebooks,
+        )
+        condition_dim = 0 if self.condition_layer is None else int(self.condition_layer.output_dim)
+
+        self.code_embedding = nn.ModuleList(
+            nn.Embedding(self.codebook_size, self.code_embed_dim) for _ in range(self.num_codebooks)
+        )
+        self.stage_condition_projectors = (
+            None
+            if condition_dim == 0
+            else nn.ModuleList(
+                nn.Sequential(
+                    nn.Linear(condition_dim, self.stage_hidden_dim),
+                    nn.SiLU(),
+                )
+                for _ in range(self.num_codebooks)
+            )
+        )
+        self.stage_heads = nn.ModuleList(
+            nn.Sequential(
+                nn.Linear(
+                    self.code_embed_dim + (self.stage_hidden_dim if condition_dim > 0 else 0),
+                    self.stage_fusion_hidden_dim,
+                ),
+                nn.SiLU(),
+                nn.Linear(self.stage_fusion_hidden_dim, stage_height * stage_width),
+            )
+            for stage_height, stage_width in self.stage_sizes
+        )
         self._reset_parameters()
 
     @property
-    def slm_input_height(self) -> int:
-        return self.input_height
+    def phase_period_rad(self) -> float:
+        return float(self.phase_alpha_pi * math.pi)
 
-    @property
-    def slm_input_width(self) -> int:
-        return self.input_width
+    @staticmethod
+    def _build_stage_sizes(
+        *,
+        output_height: int,
+        output_width: int,
+        num_codebooks: int,
+    ) -> tuple[tuple[int, int], ...]:
+        divisor = 2 ** max(num_codebooks - 1, 0)
+        if output_height % divisor != 0 or output_width % divisor != 0:
+            raise ValueError(
+                "output_height and output_width must be divisible by 2**(num_codebooks-1), "
+                f"got {(output_height, output_width)} with num_codebooks={num_codebooks}"
+            )
+        base_height = output_height // divisor
+        base_width = output_width // divisor
+        return tuple(
+            (base_height * (2 ** index), base_width * (2 ** index))
+            for index in range(num_codebooks)
+        )
 
-    @property
-    def num_prefix_readouts(self) -> int:
-        return self.num_levels
+    def _init_linear(self, layer: nn.Linear, mode: str) -> None:
+        if mode == "kaiming_uniform":
+            init.kaiming_uniform_(layer.weight, nonlinearity="relu")
+        elif mode == "kaiming_normal":
+            init.kaiming_normal_(layer.weight, nonlinearity="relu")
+        elif mode == "xavier_uniform":
+            init.xavier_uniform_(layer.weight)
+        elif mode == "xavier_normal":
+            init.xavier_normal_(layer.weight)
+        else:
+            raise ValueError(f"Unsupported hierarchical encoder init mode: {mode!r}")
+        if layer.bias is not None:
+            init.zeros_(layer.bias)
 
     def _reset_parameters(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                init.kaiming_uniform_(module.weight, nonlinearity="relu")
-                if module.bias is not None:
-                    init.zeros_(module.bias)
-
-    def _apply_output_activation(self, readouts: torch.Tensor) -> torch.Tensor:
-        if self.output_activation == "sigmoid":
-            return torch.sigmoid(readouts)
-        if self.output_activation == "softplus":
-            return F.softplus(readouts)
-        return readouts
+        for embedding in self.code_embedding:
+            init.normal_(embedding.weight, mean=0.0, std=0.02)
+        if self.stage_condition_projectors is not None:
+            for projector in self.stage_condition_projectors:
+                for module in projector:
+                    if isinstance(module, nn.Linear):
+                        self._init_linear(module, "kaiming_uniform")
+        for head in self.stage_heads:
+            linear_layers = [module for module in head if isinstance(module, nn.Linear)]
+            for module in linear_layers[:-1]:
+                self._init_linear(module, "kaiming_uniform")
+            self._init_linear(linear_layers[-1], self.output_weight_init)
 
     def forward(
         self,
-        slm_input: torch.Tensor,
+        sample: torch.Tensor,
         *,
-        error_factor: float | None = None,
-    ) -> dict[str, torch.Tensor | tuple[torch.Tensor, ...]]:
-        del error_factor
-        if slm_input.dim() != 4 or int(slm_input.shape[1]) != 1:
-            raise ValueError(f"slm_input must be [B,1,H,W], got {tuple(slm_input.shape)}")
-        if tuple(slm_input.shape[-2:]) != (self.input_height, self.input_width):
+        timesteps: torch.Tensor | int | None = None,
+        class_labels: torch.Tensor | None = None,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del timesteps
+        codes = sample.to(dtype=torch.long)
+        if codes.dim() == 1:
+            codes = codes.unsqueeze(0)
+        if codes.dim() != 2 or int(codes.shape[1]) != self.num_codebooks:
             raise ValueError(
-                "slm_input spatial shape must match decoder input grid: "
-                f"expected={(self.input_height, self.input_width)}, "
-                f"got={tuple(slm_input.shape[-2:])}"
+                f"sample must be discrete RVQ codes [B,{self.num_codebooks}] or [{self.num_codebooks}], "
+                f"got {tuple(codes.shape)}"
             )
+        batch_size = int(codes.shape[0])
 
-        hidden = self.backbone(slm_input.to(dtype=torch.float32))
-        readout_stack = self.head(hidden)
-        if tuple(readout_stack.shape[-2:]) != (self.output_height, self.output_width):
-            align_corners = False if self.upsample_mode in {"bilinear", "bicubic"} else None
-            readout_stack = F.interpolate(
-                readout_stack,
-                size=(self.output_height, self.output_width),
-                mode=self.upsample_mode,
-                align_corners=align_corners,
-            )
-        readout_stack = self._apply_output_activation(readout_stack)
-        prefix_readouts = tuple(
-            readout_stack[:, index : index + 1] for index in range(self.num_levels)
-        )
-        output: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {
-            "prefix_readouts": prefix_readouts,
-            "final_detector": prefix_readouts[-1],
-        }
-        for index, readout in enumerate(prefix_readouts, start=1):
-            output[f"prefix_readout_{index}"] = readout
-        return output
+        condition_repr = None
+        if self.condition_layer is not None:
+            resolved_condition = class_labels if condition is None else condition
+            if resolved_condition is None:
+                raise ValueError("condition must be provided when conditioning is enabled")
+            condition_repr = self.condition_layer(resolved_condition.to(device=codes.device))
+            if int(condition_repr.shape[0]) != batch_size:
+                raise ValueError("condition batch size must match latent batch size")
+        elif class_labels is not None or condition is not None:
+            raise ValueError("condition must not be provided when conditioning is disabled")
+
+        stage_maps: list[torch.Tensor] = []
+        align_corners = False if self.upsample_mode in {"bilinear", "bicubic"} else None
+        for index, ((stage_height, stage_width), embedding, head) in enumerate(
+            zip(self.stage_sizes, self.code_embedding, self.stage_heads)
+        ):
+            code_repr = embedding(codes[:, index]).to(dtype=torch.float32)
+            if condition_repr is not None:
+                if self.stage_condition_projectors is None:
+                    raise RuntimeError("stage_condition_projectors must exist when conditioning is enabled")
+                stage_condition = self.stage_condition_projectors[index](condition_repr.to(dtype=torch.float32))
+                stage_input = torch.cat((code_repr, stage_condition), dim=1)
+            else:
+                stage_input = code_repr
+            stage_map = head(stage_input).reshape(batch_size, 1, stage_height, stage_width)
+            if (stage_height, stage_width) != (self.output_height, self.output_width):
+                stage_map = F.interpolate(
+                    stage_map,
+                    size=(self.output_height, self.output_width),
+                    mode=self.upsample_mode,
+                    align_corners=align_corners,
+                )
+            stage_maps.append(stage_map)
+
+        raw_phase = torch.stack(stage_maps, dim=0).sum(dim=0)
+        return torch.remainder(raw_phase, self.phase_period_rad)
 
 
 class OpticalPrefixReadoutDecoder(nn.Module):

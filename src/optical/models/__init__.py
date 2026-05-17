@@ -1,7 +1,7 @@
 from conditioning import ConditionEmbeddingLayer
 from optical.models.multiscale import (
     ConditionalPhaseSLMEncoder,
-    DigitalPrefixReadoutDecoder,
+    HierarchicalRVQPhaseMapEncoder,
     LatentPhaseMapEncoder,
     OpticalMultiscaleModel,
     OpticalPrefixReadoutDecoder,
@@ -11,7 +11,7 @@ from optical.models.multiscale import (
 __all__ = [
     "ConditionEmbeddingLayer",
     "ConditionalPhaseSLMEncoder",
-    "DigitalPrefixReadoutDecoder",
+    "HierarchicalRVQPhaseMapEncoder",
     "PhaseMapEncoder",
     "LatentPhaseMapEncoder",
     "OpticalMultiscaleModel",
