@@ -15,6 +15,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from scripts.train_optical_multiscale import (
+    _build_optimizer,
     _build_dataset_and_loader,
     _infer_encoder_architecture,
     _build_model,
@@ -215,6 +216,28 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
 
             history_lines = (outputs_dir / "history.jsonl").read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(history_lines), 2)
+
+    def test_optimizer_can_use_separate_encoder_and_decoder_learning_rates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, _, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["training"]["encoder_lr"] = 2.0e-4
+            config["training"]["decoder_lr"] = 5.0e-4
+            sample_item = {
+                "target_final": torch.zeros((1, 8, 8), dtype=torch.float32),
+                "label": torch.tensor(1, dtype=torch.long),
+            }
+            model = _build_model(config, sample_item=sample_item)
+
+            optimizer = _build_optimizer(model, train_cfg=dict(config["training"]))
+            group_lrs = {
+                str(group.get("group_name", f"group_{index}")): float(group["lr"])
+                for index, group in enumerate(optimizer.param_groups)
+            }
+
+            self.assertEqual(group_lrs["encoder"], 2.0e-4)
+            self.assertEqual(group_lrs["decoder"], 5.0e-4)
 
     def test_fixed_latent_depends_on_sample_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

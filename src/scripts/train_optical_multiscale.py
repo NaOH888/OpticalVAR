@@ -597,6 +597,35 @@ def _resolve_resume_path(
     return _resolve_path(str(raw_value), config_dir=config_dir, repo_root=repo_root)
 
 
+def _build_optimizer(
+    model: OpticalMultiscaleModel,
+    *,
+    train_cfg: dict[str, Any],
+) -> torch.optim.Optimizer:
+    base_lr = float(train_cfg.get("lr", 1.0e-3))
+    encoder_lr = float(train_cfg.get("encoder_lr", base_lr))
+    decoder_lr = float(train_cfg.get("decoder_lr", base_lr))
+    weight_decay = float(train_cfg.get("weight_decay", 0.0))
+
+    param_groups = [
+        {
+            "params": list(model.encoder.parameters()),
+            "lr": encoder_lr,
+            "group_name": "encoder",
+        },
+        {
+            "params": list(model.optical_decoder.parameters()),
+            "lr": decoder_lr,
+            "group_name": "decoder",
+        },
+    ]
+    return torch.optim.Adam(
+        param_groups,
+        lr=base_lr,
+        weight_decay=weight_decay,
+    )
+
+
 def _load_resume_checkpoint(
     *,
     model: OpticalMultiscaleModel,
@@ -748,11 +777,11 @@ def train(
     config.setdefault("encoder", {})["architecture"] = architecture_override
     model = _build_model(config, sample_item=sample_item, architecture_override=architecture_override).to(device)
     criterion = _build_loss(config, multiscale_transform=multiscale_transform, device=device)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=float(train_cfg.get("lr", 1.0e-3)),
-        weight_decay=float(train_cfg.get("weight_decay", 0.0)),
-    )
+    optimizer = _build_optimizer(model, train_cfg=train_cfg)
+    optimizer_group_lrs = {
+        str(group.get("group_name", f"group_{index}")): float(group["lr"])
+        for index, group in enumerate(optimizer.param_groups)
+    }
 
     output_dir = _resolve_path(str(train_cfg["output_dir"]), config_dir=config_dir, repo_root=repo_root)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -862,6 +891,7 @@ def train(
             "perceptual_loss": running_perceptual / step_count,
             "latent_diversity_loss": running_latent_diversity / step_count,
             "level_weights": list(criterion.level_weights),
+            "optimizer_lrs": optimizer_group_lrs,
         }
         print(
             f"[epoch {epoch_idx + 1}/{max_epochs}] "
@@ -873,7 +903,8 @@ def train(
             f"bg={latest_metrics['background_loss']:.6f} "
             f"perc={latest_metrics['perceptual_loss']:.6f} "
             f"latent_div={latest_metrics['latent_diversity_loss']:.6f} "
-            f"level_weights={latest_metrics['level_weights']}"
+            f"level_weights={latest_metrics['level_weights']} "
+            f"lrs={latest_metrics['optimizer_lrs']}"
         )
         _append_jsonl(history_path, latest_metrics)
 
