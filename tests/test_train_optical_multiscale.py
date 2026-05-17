@@ -360,6 +360,39 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             self.assertEqual(int(phase_layer.sx), 6)
             self.assertEqual(int(phase_layer.sy), 6)
 
+    def test_phase_layer_freeze_flags_disable_selected_surfaces(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, _, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["multiscale"]["num_levels"] = 3
+            config["optical"]["distances_m"]["between_layers_m"] = [2.0e-6, 2.0e-6]
+            config["optical"]["phase_layer"]["freeze_layer"] = [True, True, False]
+
+            model = _build_model(
+                config,
+                sample_item={
+                    "target_final": torch.zeros((1, 8, 8), dtype=torch.float32),
+                    "latent": torch.zeros((4, 2, 2), dtype=torch.float32),
+                    "label": torch.zeros((2,), dtype=torch.float32),
+                },
+            )
+            optimizer = _build_optimizer(model, train_cfg=dict(config["training"]))
+
+            optical_layers = list(model.optical_decoder.optical_layers)
+            self.assertEqual(len(optical_layers), 3)
+            self.assertFalse(optical_layers[0].raw_phase.requires_grad)
+            self.assertFalse(optical_layers[1].raw_phase.requires_grad)
+            self.assertTrue(optical_layers[2].raw_phase.requires_grad)
+
+            decoder_params = set()
+            for group in optimizer.param_groups:
+                if str(group.get("group_name")) == "decoder":
+                    decoder_params.update(id(param) for param in group["params"])
+            self.assertNotIn(id(optical_layers[0].raw_phase), decoder_params)
+            self.assertNotIn(id(optical_layers[1].raw_phase), decoder_params)
+            self.assertIn(id(optical_layers[2].raw_phase), decoder_params)
+
     def test_training_can_apply_swing_level_weight_schedule(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

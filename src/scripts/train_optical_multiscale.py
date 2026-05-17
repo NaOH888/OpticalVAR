@@ -186,6 +186,24 @@ def _resolve_phase_layer_geometry(
     return width_m, height_m, phase_grid_height, phase_grid_width
 
 
+def _resolve_frozen_phase_layers(
+    *,
+    phase_cfg: dict[str, Any],
+    num_levels: int,
+) -> tuple[bool, ...]:
+    raw_value = phase_cfg.get("freeze_layer")
+    if raw_value is None:
+        return tuple(False for _ in range(num_levels))
+    if isinstance(raw_value, bool):
+        return tuple(bool(raw_value) for _ in range(num_levels))
+    values = tuple(bool(value) for value in raw_value)
+    if len(values) != num_levels:
+        raise ValueError(
+            f"phase_layer.freeze_layer must have length {num_levels}, got {len(values)}"
+        )
+    return values
+
+
 def _build_model(
     config: dict[str, Any],
     *,
@@ -215,14 +233,14 @@ def _build_model(
     )
 
     phase_cfg = dict(optical_cfg["phase_layer"])
+    frozen_phase_layers = _resolve_frozen_phase_layers(phase_cfg=phase_cfg, num_levels=num_levels)
     optical_layers = []
-    for _ in range(num_levels):
+    for layer_index in range(num_levels):
         width_m, height_m, phase_grid_height, phase_grid_width = _resolve_phase_layer_geometry(
             phase_cfg=phase_cfg,
             slm=slm,
         )
-        optical_layers.append(
-            DiffractivePhaseLayer(
+        layer = DiffractivePhaseLayer(
                 width_m=width_m,
                 height_m=height_m,
                 dx_m=slm.dx,
@@ -240,7 +258,9 @@ def _build_model(
                     phase_grid_width=phase_grid_width,
                 ),
             )
-        )
+        if frozen_phase_layers[layer_index]:
+            layer.requires_grad_(False)
+        optical_layers.append(layer)
 
     detector_cfg = DetectorConfig(
         width_num=int(optical_cfg["detector"]["width_num"]),
@@ -483,16 +503,19 @@ def _build_optimizer(
 
     param_groups = [
         {
-            "params": list(model.encoder.parameters()),
+            "params": [param for param in model.encoder.parameters() if param.requires_grad],
             "lr": encoder_lr,
             "group_name": "encoder",
         },
         {
-            "params": list(model.optical_decoder.parameters()),
+            "params": [param for param in model.optical_decoder.parameters() if param.requires_grad],
             "lr": decoder_lr,
             "group_name": "decoder",
         },
     ]
+    if not any(group["params"] for group in param_groups):
+        raise ValueError("No trainable parameters found after applying freeze settings")
+    param_groups = [group for group in param_groups if group["params"]]
     return torch.optim.Adam(
         param_groups,
         lr=base_lr,
