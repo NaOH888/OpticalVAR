@@ -20,17 +20,11 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(SRC_ROOT))
 
 from optical.data import NpzImageDataset
-
-
-def _load_autoencoder_cls():
-    try:
-        from diffusers import AutoencoderKL  # type: ignore
-    except ImportError as exc:  # pragma: no cover - dependency is optional in local tests
-        raise ImportError(
-            "diffusers is required for pretrained autoencoder reconstruction. "
-            "Install it on the target machine, e.g. `pip install diffusers transformers accelerate safetensors`."
-        ) from exc
-    return AutoencoderKL
+from scripts._pretrained_autoencoder_utils import l2_loss as _l2_loss
+from scripts._pretrained_autoencoder_utils import load_autoencoder_cls as _load_autoencoder_cls
+from scripts._pretrained_autoencoder_utils import psnr as _psnr
+from scripts._pretrained_autoencoder_utils import tensor_gray_to_rgb as _tensor_gray_to_rgb
+from scripts._pretrained_autoencoder_utils import tensor_rgb_to_gray as _tensor_rgb_to_gray
 
 
 def _normalize_image(image: np.ndarray) -> np.ndarray:
@@ -40,31 +34,6 @@ def _normalize_image(image: np.ndarray) -> np.ndarray:
     if max_value <= min_value:
         return np.zeros_like(image, dtype=np.float32)
     return (image - min_value) / (max_value - min_value)
-
-
-def _tensor_gray_to_rgb(image: torch.Tensor) -> torch.Tensor:
-    if image.dim() != 4:
-        raise ValueError(f"expected BCHW tensor, got shape {tuple(image.shape)}")
-    if int(image.shape[1]) == 3:
-        return image
-    if int(image.shape[1]) != 1:
-        raise ValueError(f"expected 1 or 3 channels, got {tuple(image.shape)}")
-    return image.repeat(1, 3, 1, 1)
-
-
-def _tensor_rgb_to_gray(image: torch.Tensor) -> torch.Tensor:
-    if image.dim() != 4 or int(image.shape[1]) != 3:
-        raise ValueError(f"expected RGB BCHW tensor, got shape {tuple(image.shape)}")
-    weights = torch.tensor([0.299, 0.587, 0.114], device=image.device, dtype=image.dtype).view(1, 3, 1, 1)
-    return (image * weights).sum(dim=1, keepdim=True)
-
-
-def _psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
-    mse = torch.mean((pred - target) ** 2).item()
-    if mse <= 1e-12:
-        return float("inf")
-    return float(20.0 * math.log10(1.0 / math.sqrt(mse)))
-
 
 def _save_grid(
     images: list[np.ndarray],
@@ -111,6 +80,7 @@ def reconstruct_samples(
     output_dir: Path,
     sample_indices: list[int],
     metric_max_items: int,
+    metric_fraction: float | None,
     batch_size: int,
     device: str,
 ) -> dict[str, Any]:
@@ -127,9 +97,15 @@ def reconstruct_samples(
         grid_titles: list[str] = []
         per_sample: list[dict[str, Any]] = []
         l1_values: list[float] = []
+        l2_values: list[float] = []
         psnr_values: list[float] = []
 
-        metric_limit = min(int(metric_max_items), len(dataset))
+        if metric_fraction is not None:
+            if not 0.0 < float(metric_fraction) <= 1.0:
+                raise ValueError(f"metric_fraction must be in (0,1], got {metric_fraction!r}")
+            metric_limit = max(1, int(round(len(dataset) * float(metric_fraction))))
+        else:
+            metric_limit = min(int(metric_max_items), len(dataset))
         current_batch: list[torch.Tensor] = []
         current_indices: list[int] = []
 
@@ -149,6 +125,7 @@ def reconstruct_samples(
                 original = originals[batch_offset]
                 recon = recon_gray[batch_offset]
                 l1_value = float(torch.mean(torch.abs(recon - original)).item())
+                l2_value = _l2_loss(recon, original)
                 psnr_value = _psnr(recon, original)
                 if dataset_index in chosen_indices:
                     original_np = original[0].numpy()
@@ -160,10 +137,12 @@ def reconstruct_samples(
                             "sample_index": int(dataset_index),
                             "sample_id": int(dataset[dataset_index]["sample_id"]),
                             "l1": l1_value,
+                            "l2": l2_value,
                             "psnr": psnr_value,
                         }
                     )
                 l1_values.append(l1_value)
+                l2_values.append(l2_value)
                 psnr_values.append(psnr_value)
             current_batch.clear()
             current_indices.clear()
@@ -185,9 +164,14 @@ def reconstruct_samples(
             "model_id": str(model_id),
             "device": str(device),
             "metric_items": int(metric_limit),
+            "metric_fraction": None if metric_fraction is None else float(metric_fraction),
             "sample_indices": [int(index) for index in chosen_indices],
             "mean_l1": float(np.mean(l1_values)) if l1_values else None,
+            "std_l1": float(np.std(l1_values)) if l1_values else None,
+            "mean_l2": float(np.mean(l2_values)) if l2_values else None,
+            "std_l2": float(np.std(l2_values)) if l2_values else None,
             "mean_psnr": float(np.mean(psnr_values)) if psnr_values else None,
+            "std_psnr": float(np.std(psnr_values)) if psnr_values else None,
             "samples": per_sample,
         }
         (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -226,7 +210,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--metric-max-items",
         type=int,
         default=64,
-        help="How many dataset items to use when averaging L1 / PSNR.",
+        help="How many dataset items to use when averaging L1 / L2 / PSNR when metric_fraction is not set.",
+    )
+    parser.add_argument(
+        "--metric-fraction",
+        type=float,
+        default=None,
+        help="Optional dataset fraction in (0,1] used for averaging metrics. Overrides metric_max_items.",
     )
     parser.add_argument(
         "--batch-size",
@@ -251,6 +241,7 @@ def main(argv: list[str] | None = None) -> None:
         output_dir=args.output_dir.resolve(),
         sample_indices=_parse_indices(args.sample_indices),
         metric_max_items=int(args.metric_max_items),
+        metric_fraction=args.metric_fraction,
         batch_size=int(args.batch_size),
         device=str(args.device),
     )

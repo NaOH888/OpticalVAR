@@ -1,6 +1,7 @@
 {
   "runtime": {
-    "seed": 42
+    "seed": 42,
+    "device": "cuda"
   },
   "dataset": {
     "dataset_name": "celeba",
@@ -9,16 +10,13 @@
     "channel_mode": "keep",
     "max_items": null
   },
-  "rvq": {
-    "pca_dim": 512,
-    "num_stages": 32,
-    "codebook_size": 512,
-    "batch_size": 1024,
-    "pca_fit_max_items": null,
-    "rvq_fit_max_items": null
+  "autoencoder": {
+    "model_id": "stabilityai/sd-vae-ft-mse",
+    "latent_mode": "mode",
+    "batch_size": 8
   },
   "export": {
     "shard_size": 4096,
-    "output_manifest_path": "dataset/celeba_rvq/celeba_train_rvq_lm.json"
+    "output_manifest_path": "dataset/celeba_autoencoderkl/celeba_train_autoencoderkl_lm.json"
   }
 }

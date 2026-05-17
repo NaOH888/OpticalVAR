@@ -50,9 +50,9 @@ class NpzImageDataset(Dataset):
                 "channel_mode must be one of {'keep', 'first', 'mean'}, "
                 f"got {self.channel_mode!r}"
             )
-        if self.latent_source is not None and self.latent_source not in {"cvae", "rvq"}:
+        if self.latent_source is not None and self.latent_source not in {"cvae", "rvq", "autoencoderkl"}:
             raise ValueError(
-                "latent_source must be one of {'cvae', 'rvq'} when provided, "
+                "latent_source must be one of {'cvae', 'rvq', 'autoencoderkl'} when provided, "
                 f"got {self.latent_source!r}"
             )
         if self.latent_type is not None and self.latent_type not in {"continuous_map", "discrete_code"}:
