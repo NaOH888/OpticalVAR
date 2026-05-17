@@ -375,6 +375,8 @@ def _build_model(
                 condition_layer=condition_layer,
                 stage_hidden_dim=int(encoder_cfg.get("hidden_dim", 512)),
                 stage_fusion_hidden_dim=encoder_cfg.get("fusion_hidden_dim"),
+                spatial_levels=encoder_cfg.get("rvq_spatial_levels"),
+                stage_group_sizes=encoder_cfg.get("rvq_stage_group_sizes"),
                 upsample_mode="bilinear",
                 phase_alpha_pi=float(encoder_cfg.get("phase_alpha_pi", 2.0)),
                 output_weight_init=str(encoder_cfg.get("output_weight_init", "xavier_uniform")),

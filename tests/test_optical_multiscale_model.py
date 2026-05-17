@@ -209,6 +209,37 @@ class OpticalMultiscaleModelTests(unittest.TestCase):
         self.assertTrue(torch.all(output >= 0.0).item())
         self.assertTrue(torch.all(output < encoder.phase_period_rad).item())
 
+    def test_hierarchical_rvq_phase_map_encoder_supports_many_codebooks_grouped_into_few_spatial_levels(self) -> None:
+        encoder = HierarchicalRVQPhaseMapEncoder(
+            num_codebooks=32,
+            codebook_size=32,
+            code_embed_dim=8,
+            output_height=176,
+            output_width=176,
+            condition_layer=ConditionEmbeddingLayer(
+                mode="attribute_vector",
+                input_dim=5,
+                output_dim=10,
+                hidden_dim=12,
+            ),
+            spatial_levels=5,
+            stage_hidden_dim=16,
+            stage_fusion_hidden_dim=24,
+            phase_alpha_pi=2.0,
+        )
+
+        output = encoder(
+            torch.arange(32, dtype=torch.long).unsqueeze(0) % 32,
+            condition=torch.tensor([[1, 0, 1, 0, 1]], dtype=torch.float32),
+        )
+
+        self.assertEqual(tuple(output.shape), (1, 1, 176, 176))
+        self.assertEqual(len(encoder.level_sizes), 5)
+        self.assertEqual(encoder.level_sizes, ((11, 11), (22, 22), (44, 44), (88, 88), (176, 176)))
+        self.assertEqual(len(encoder.stage_level_indices), 32)
+        self.assertEqual(max(encoder.stage_level_indices), 4)
+        self.assertTrue(torch.isfinite(output).all().item())
+
     def test_prefix_readout_decoder_returns_detector_plane_prefixes(self) -> None:
         source_config = SourceConfig(
             wavelengths_m=(532e-9,),

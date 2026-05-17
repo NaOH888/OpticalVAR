@@ -394,6 +394,8 @@ class HierarchicalRVQPhaseMapEncoder(nn.Module):
         condition_layer: ConditionEmbeddingLayer | None = None,
         stage_hidden_dim: int = 512,
         stage_fusion_hidden_dim: int | None = None,
+        spatial_levels: int | None = None,
+        stage_group_sizes: Sequence[int] | None = None,
         upsample_mode: str = "bilinear",
         phase_alpha_pi: float = 2.0,
         output_weight_init: str = "xavier_uniform",
@@ -409,6 +411,8 @@ class HierarchicalRVQPhaseMapEncoder(nn.Module):
         self.stage_fusion_hidden_dim = int(
             stage_fusion_hidden_dim if stage_fusion_hidden_dim is not None else self.stage_hidden_dim
         )
+        self.spatial_levels = None if spatial_levels is None else int(spatial_levels)
+        self.stage_group_sizes = None if stage_group_sizes is None else tuple(int(value) for value in stage_group_sizes)
         self.upsample_mode = str(upsample_mode)
         self.phase_alpha_pi = float(phase_alpha_pi)
         self.output_weight_init = str(output_weight_init)
@@ -423,12 +427,20 @@ class HierarchicalRVQPhaseMapEncoder(nn.Module):
             raise ValueError("output_height and output_width must be positive")
         if self.stage_hidden_dim <= 0 or self.stage_fusion_hidden_dim <= 0:
             raise ValueError("stage hidden dimensions must be positive")
+        if self.spatial_levels is not None and self.spatial_levels <= 0:
+            raise ValueError(f"spatial_levels must be positive when provided, got {spatial_levels!r}")
 
-        self.stage_sizes = self._build_stage_sizes(
+        self.stage_level_indices = self._build_stage_level_indices(
+            num_codebooks=self.num_codebooks,
+            spatial_levels=self.spatial_levels,
+            stage_group_sizes=self.stage_group_sizes,
+        )
+        self.level_sizes = self._build_level_sizes(
             output_height=self.output_height,
             output_width=self.output_width,
-            num_codebooks=self.num_codebooks,
+            num_levels=max(self.stage_level_indices) + 1,
         )
+        self.stage_sizes = tuple(self.level_sizes[level_index] for level_index in self.stage_level_indices)
         condition_dim = 0 if self.condition_layer is None else int(self.condition_layer.output_dim)
 
         self.code_embedding = nn.ModuleList(
@@ -463,23 +475,62 @@ class HierarchicalRVQPhaseMapEncoder(nn.Module):
         return float(self.phase_alpha_pi * math.pi)
 
     @staticmethod
-    def _build_stage_sizes(
+    def _build_stage_level_indices(
+        *,
+        num_codebooks: int,
+        spatial_levels: int | None,
+        stage_group_sizes: Sequence[int] | None,
+    ) -> tuple[int, ...]:
+        if stage_group_sizes is not None:
+            if len(stage_group_sizes) == 0:
+                raise ValueError("stage_group_sizes must not be empty when provided")
+            if any(int(value) <= 0 for value in stage_group_sizes):
+                raise ValueError(f"stage_group_sizes must contain only positive values, got {stage_group_sizes!r}")
+            if sum(int(value) for value in stage_group_sizes) != int(num_codebooks):
+                raise ValueError(
+                    f"sum(stage_group_sizes) must equal num_codebooks, got {stage_group_sizes!r} vs {num_codebooks}"
+                )
+            assignments: list[int] = []
+            for level_index, group_size in enumerate(stage_group_sizes):
+                assignments.extend([int(level_index)] * int(group_size))
+            return tuple(assignments)
+
+        num_levels = int(spatial_levels) if spatial_levels is not None else int(num_codebooks)
+        if num_levels <= 0:
+            raise ValueError(f"num_levels must be positive, got {num_levels}")
+        if num_levels > int(num_codebooks):
+            raise ValueError(
+                f"spatial_levels must be <= num_codebooks, got spatial_levels={num_levels} "
+                f"and num_codebooks={num_codebooks}"
+            )
+        base_group = int(num_codebooks) // num_levels
+        remainder = int(num_codebooks) % num_levels
+        group_sizes = [base_group for _ in range(num_levels)]
+        for index in range(remainder):
+            group_sizes[num_levels - 1 - index] += 1
+        assignments = []
+        for level_index, group_size in enumerate(group_sizes):
+            assignments.extend([level_index] * int(group_size))
+        return tuple(assignments)
+
+    @staticmethod
+    def _build_level_sizes(
         *,
         output_height: int,
         output_width: int,
-        num_codebooks: int,
+        num_levels: int,
     ) -> tuple[tuple[int, int], ...]:
-        divisor = 2 ** max(num_codebooks - 1, 0)
+        divisor = 2 ** max(num_levels - 1, 0)
         if output_height % divisor != 0 or output_width % divisor != 0:
             raise ValueError(
-                "output_height and output_width must be divisible by 2**(num_codebooks-1), "
-                f"got {(output_height, output_width)} with num_codebooks={num_codebooks}"
+                "output_height and output_width must be divisible by 2**(num_levels-1), "
+                f"got {(output_height, output_width)} with num_levels={num_levels}"
             )
         base_height = output_height // divisor
         base_width = output_width // divisor
         return tuple(
             (base_height * (2 ** index), base_width * (2 ** index))
-            for index in range(num_codebooks)
+            for index in range(num_levels)
         )
 
     def _init_linear(self, layer: nn.Linear, mode: str) -> None:
