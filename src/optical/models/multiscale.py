@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
 
-from conditioning import ConditionEmbeddingLayer, ConditionalLatentFusion, LatentEmbeddingLayer
+from conditioning import ConditionEmbeddingLayer
 from optical.core import PropagateContext, PropagationConfig, PropagationErrorConfig
 from optical.core.base import OpticLayer, SourceLayer
 from optical.layers.detector import DetectorLayer
@@ -38,8 +38,146 @@ def _build_positional_timestep_embedding(
     return embedding
 
 
-class ConditionalPhaseSLMEncoder(nn.Module):
-    """Digital encoder that maps latent noise and optional conditions to an SLM phase map."""
+def _init_linear_or_conv(module: nn.Module, mode: str) -> None:
+    if isinstance(module, nn.Conv2d):
+        weight = module.weight
+    elif isinstance(module, nn.Linear):
+        weight = module.weight
+    else:
+        raise TypeError(f"Unsupported module type for initialization: {type(module).__name__}")
+    if mode == "kaiming_uniform":
+        init.kaiming_uniform_(weight, nonlinearity="relu")
+    elif mode == "kaiming_normal":
+        init.kaiming_normal_(weight, nonlinearity="relu")
+    elif mode == "xavier_uniform":
+        init.xavier_uniform_(weight)
+    elif mode == "xavier_normal":
+        init.xavier_normal_(weight)
+    else:
+        raise ValueError(f"Unsupported init mode: {mode!r}")
+    if getattr(module, "bias", None) is not None:
+        init.zeros_(module.bias)
+
+
+def _interpolate_like(
+    tensor: torch.Tensor,
+    *,
+    size: tuple[int, int],
+    mode: str,
+) -> torch.Tensor:
+    if tuple(tensor.shape[-2:]) == tuple(size):
+        return tensor
+    if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+        return F.interpolate(tensor, size=size, mode=mode, align_corners=False)
+    return F.interpolate(tensor, size=size, mode=mode)
+
+
+def _build_spatial_stage_sizes(
+    *,
+    input_height: int,
+    input_width: int,
+    output_height: int,
+    output_width: int,
+) -> tuple[tuple[int, int], ...]:
+    sizes = [(int(input_height), int(input_width))]
+    current_h = int(input_height)
+    current_w = int(input_width)
+    while current_h < int(output_height) or current_w < int(output_width):
+        next_h = min(current_h * 2, int(output_height))
+        next_w = min(current_w * 2, int(output_width))
+        if next_h == current_h and next_w == current_w:
+            break
+        sizes.append((next_h, next_w))
+        current_h, current_w = next_h, next_w
+    if sizes[-1] != (int(output_height), int(output_width)):
+        sizes.append((int(output_height), int(output_width)))
+    return tuple(sizes)
+
+
+def _build_hidden_channels(
+    *,
+    stage_count: int,
+    hidden_dim: int,
+    hidden_channels: Sequence[int] | None,
+) -> tuple[int, ...]:
+    if hidden_channels is not None:
+        resolved = tuple(int(value) for value in hidden_channels)
+        if len(resolved) != stage_count:
+            raise ValueError(
+                f"hidden_channels must have length {stage_count}, got {len(resolved)}"
+            )
+        if any(value <= 0 for value in resolved):
+            raise ValueError(f"hidden_channels must be positive, got {resolved!r}")
+        return resolved
+    base_channels = min(int(hidden_dim), 96)
+    resolved = [base_channels]
+    for index in range(1, stage_count):
+        resolved.append(max(base_channels // (2**index), 16))
+    return tuple(int(value) for value in resolved)
+
+
+class _FiLMModulation(nn.Module):
+    def __init__(self, *, condition_dim: int, feature_dim: int) -> None:
+        super().__init__()
+        self.condition_dim = int(condition_dim)
+        self.feature_dim = int(feature_dim)
+        self.projector = nn.Linear(self.condition_dim, 2 * self.feature_dim)
+
+    def forward(self, features: torch.Tensor, condition_repr: torch.Tensor) -> torch.Tensor:
+        modulation = self.projector(condition_repr).to(dtype=features.dtype)
+        gamma, beta = modulation.chunk(2, dim=1)
+        gamma = gamma.view(features.shape[0], self.feature_dim, 1, 1)
+        beta = beta.view(features.shape[0], self.feature_dim, 1, 1)
+        return features * (1.0 + gamma) + beta
+
+
+class _DepthwisePointwiseBlock(nn.Module):
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        out_channels: int,
+        condition_dim: int | None,
+    ) -> None:
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            int(in_channels),
+            int(in_channels),
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=int(in_channels),
+            bias=True,
+        )
+        self.pointwise = nn.Conv2d(
+            int(in_channels),
+            int(out_channels),
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=True,
+        )
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=int(out_channels))
+        self.modulation = (
+            None
+            if condition_dim is None
+            else _FiLMModulation(condition_dim=int(condition_dim), feature_dim=int(out_channels))
+        )
+        self.act = nn.SiLU()
+
+    def forward(self, features: torch.Tensor, condition_repr: torch.Tensor | None) -> torch.Tensor:
+        hidden = self.depthwise(features)
+        hidden = self.pointwise(hidden)
+        hidden = self.norm(hidden)
+        if self.modulation is not None:
+            if condition_repr is None:
+                raise ValueError("condition_repr must be provided when modulation is enabled")
+            hidden = self.modulation(hidden, condition_repr)
+        return self.act(hidden)
+
+
+class SpatialPhaseMapEncoder(nn.Module):
+    """Map a spatial latent map directly to a single-channel phase map."""
 
     def __init__(
         self,
@@ -50,20 +188,14 @@ class ConditionalPhaseSLMEncoder(nn.Module):
         output_height: int,
         output_width: int,
         hidden_dim: int = 512,
+        hidden_channels: Sequence[int] | None = None,
         phase_alpha_pi: float = 2.0,
-        time_conditional: bool = False,
-        time_embedding_type: str = "positional",
-        time_embedding_dim: int = 128,
-        class_conditional: bool = False,
-        condition_mode: str | None = None,
-        num_classes: int = 0,
-        condition_input_dim: int | None = None,
-        class_embed_dim: int = 128,
-        class_condition_channels: int = 4,
-        condition_hidden_dim: int | None = None,
+        condition_layer: ConditionEmbeddingLayer | None = None,
+        condition_dim: int | None = None,
         weight_init: str = "kaiming_uniform",
         output_weight_init: str = "xavier_uniform",
-        embedding_init_std: float = 0.02,
+        apply_wrap: bool = True,
+        upsample_mode: str = "bilinear",
     ) -> None:
         super().__init__()
         self.input_channels = int(input_channels)
@@ -73,23 +205,12 @@ class ConditionalPhaseSLMEncoder(nn.Module):
         self.output_width = int(output_width)
         self.hidden_dim = int(hidden_dim)
         self.phase_alpha_pi = float(phase_alpha_pi)
-        self.time_conditional = bool(time_conditional)
-        self.time_embedding_type = str(time_embedding_type)
-        self.time_embedding_dim = int(time_embedding_dim)
-        self.class_conditional = bool(class_conditional)
-        self.condition_mode = (
-            "class_index" if self.class_conditional and condition_mode is None else condition_mode
-        )
-        self.num_classes = int(num_classes)
-        self.condition_input_dim = None if condition_input_dim is None else int(condition_input_dim)
-        self.class_embed_dim = int(class_embed_dim)
-        self.class_condition_channels = int(class_condition_channels)
-        self.condition_hidden_dim = (
-            None if condition_hidden_dim is None else int(condition_hidden_dim)
-        )
+        self.condition_layer = condition_layer
+        self.condition_dim = None if condition_dim is None else int(condition_dim)
         self.weight_init = str(weight_init)
         self.output_weight_init = str(output_weight_init)
-        self.embedding_init_std = float(embedding_init_std)
+        self.apply_wrap = bool(apply_wrap)
+        self.upsample_mode = str(upsample_mode)
 
         if self.input_channels <= 0:
             raise ValueError(f"input_channels must be positive, got {input_channels!r}")
@@ -99,102 +220,63 @@ class ConditionalPhaseSLMEncoder(nn.Module):
             raise ValueError("output_height and output_width must be positive")
         if self.hidden_dim <= 0:
             raise ValueError(f"hidden_dim must be positive, got {hidden_dim!r}")
-        if self.time_conditional and self.time_embedding_type not in {"positional", "fourier"}:
-            raise ValueError(
-                "time_embedding_type must be 'positional' or 'fourier' when time_conditional=True, "
-                f"got {time_embedding_type!r}"
-            )
-        if self.class_condition_channels <= 0 and self.condition_mode is not None:
-            raise ValueError(
-                "class_condition_channels must be positive when conditioning is enabled, "
-                f"got {class_condition_channels!r}"
-            )
-        if self.condition_mode is None and self.num_classes != 0:
-            raise ValueError("num_classes must be 0 when conditioning is disabled")
-        if self.condition_mode == "class_index" and self.num_classes <= 0:
-            raise ValueError("num_classes must be positive when condition_mode='class_index'")
-        if self.condition_mode == "attribute_vector" and (
-            self.condition_input_dim is None or self.condition_input_dim <= 0
-        ):
-            raise ValueError("condition_input_dim must be positive when condition_mode='attribute_vector'")
+        if self.condition_layer is None and self.condition_dim is not None:
+            raise ValueError("condition_dim must be omitted when condition_layer is disabled")
+        if self.condition_layer is not None and (self.condition_dim is None or self.condition_dim <= 0):
+            raise ValueError("condition_dim must be positive when condition_layer is enabled")
 
-        self.condition_embedding = (
-            ConditionEmbeddingLayer(
-                mode=str(self.condition_mode),
-                output_dim=self.class_condition_channels,
-                num_classes=self.num_classes if self.condition_mode == "class_index" else None,
-                input_dim=self.condition_input_dim if self.condition_mode == "attribute_vector" else None,
-                embed_dim=self.class_embed_dim,
-                hidden_dim=self.condition_hidden_dim if self.condition_hidden_dim is not None else self.hidden_dim,
-            )
-            if self.condition_mode is not None
-            else None
+        self.stage_sizes = _build_spatial_stage_sizes(
+            input_height=self.input_height,
+            input_width=self.input_width,
+            output_height=self.output_height,
+            output_width=self.output_width,
         )
-        if self.time_conditional and self.time_embedding_type == "fourier":
-            half_dim = max(self.time_embedding_dim // 2, 1)
-            fourier_weight = torch.randn((half_dim,), dtype=torch.float32)
-            self.register_buffer("_fourier_time_weight", fourier_weight, persistent=True)
-        else:
-            self.register_buffer("_fourier_time_weight", torch.empty(0), persistent=False)
-
-        conditioned_channels = self.input_channels + (
-            self.class_condition_channels if self.condition_mode is not None else 0
+        self.hidden_channels = _build_hidden_channels(
+            stage_count=len(self.stage_sizes),
+            hidden_dim=self.hidden_dim,
+            hidden_channels=hidden_channels,
         )
-        feature_dim = conditioned_channels * self.input_height * self.input_width
-        if self.time_conditional:
-            feature_dim += self.time_embedding_dim
 
-        output_dim = self.output_height * self.output_width
-        self.fc1 = nn.Linear(feature_dim, self.hidden_dim)
-        self.fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.fc3 = nn.Linear(self.hidden_dim, output_dim)
-        self.act = nn.SiLU()
+        self.stem = nn.Conv2d(self.input_channels, self.hidden_channels[0], kernel_size=1, bias=True)
+        blocks: list[nn.Module] = []
+        for index, out_channels in enumerate(self.hidden_channels):
+            in_channels = self.hidden_channels[index - 1] if index > 0 else self.hidden_channels[0]
+            blocks.append(
+                _DepthwisePointwiseBlock(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    condition_dim=self.condition_dim,
+                )
+            )
+        self.blocks = nn.ModuleList(blocks)
+        self.head = nn.Conv2d(self.hidden_channels[-1], 1, kernel_size=1, bias=True)
         self._reset_parameters()
 
     @property
     def phase_period_rad(self) -> float:
         return float(self.phase_alpha_pi * math.pi)
 
-    def _init_linear(self, layer: nn.Linear, mode: str) -> None:
-        if mode == "kaiming_uniform":
-            init.kaiming_uniform_(layer.weight, nonlinearity="relu")
-        elif mode == "kaiming_normal":
-            init.kaiming_normal_(layer.weight, nonlinearity="relu")
-        elif mode == "xavier_uniform":
-            init.xavier_uniform_(layer.weight)
-        elif mode == "xavier_normal":
-            init.xavier_normal_(layer.weight)
-        else:
-            raise ValueError(f"Unsupported encoder init mode: {mode!r}")
-        if layer.bias is not None:
-            init.zeros_(layer.bias)
-
     def _reset_parameters(self) -> None:
-        self._init_linear(self.fc1, self.weight_init)
-        self._init_linear(self.fc2, self.weight_init)
-        self._init_linear(self.fc3, self.output_weight_init)
-        if self.condition_embedding is not None:
-            embedding = getattr(self.condition_embedding, "embedding", None)
+        _init_linear_or_conv(self.stem, self.weight_init)
+        for block in self.blocks:
+            if not isinstance(block, _DepthwisePointwiseBlock):
+                continue
+            _init_linear_or_conv(block.depthwise, self.weight_init)
+            _init_linear_or_conv(block.pointwise, self.weight_init)
+            if block.modulation is not None:
+                _init_linear_or_conv(block.modulation.projector, self.weight_init)
+        _init_linear_or_conv(self.head, self.output_weight_init)
+        if self.condition_layer is not None:
+            embedding = getattr(self.condition_layer, "embedding", None)
             if isinstance(embedding, nn.Embedding):
-                init.normal_(embedding.weight, mean=0.0, std=self.embedding_init_std)
-            projector = getattr(self.condition_embedding, "projector", None)
+                init.normal_(embedding.weight, mean=0.0, std=0.02)
+            projector = getattr(self.condition_layer, "projector", None)
             if isinstance(projector, nn.Linear):
-                self._init_linear(projector, self.weight_init)
+                _init_linear_or_conv(projector, self.weight_init)
             elif isinstance(projector, nn.Sequential):
                 for module in projector:
                     if isinstance(module, nn.Linear):
-                        self._init_linear(module, self.weight_init)
-
-    def _encode_timesteps(self, timesteps: torch.Tensor) -> torch.Tensor:
-        if self.time_embedding_type == "positional":
-            return _build_positional_timestep_embedding(timesteps, self.time_embedding_dim)
-
-        frequencies = self._fourier_time_weight.to(device=timesteps.device, dtype=torch.float32)
-        arguments = timesteps.float().unsqueeze(1) * frequencies.unsqueeze(0) * (2.0 * math.pi)
-        embedding = torch.cat([torch.cos(arguments), torch.sin(arguments)], dim=1)
-        if int(embedding.shape[1]) < self.time_embedding_dim:
-            embedding = F.pad(embedding, (0, self.time_embedding_dim - int(embedding.shape[1])))
-        return embedding[:, : self.time_embedding_dim]
+                        _init_linear_or_conv(module, self.weight_init)
 
     def forward(
         self,
@@ -204,6 +286,8 @@ class ConditionalPhaseSLMEncoder(nn.Module):
         class_labels: torch.Tensor | None = None,
         condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if timesteps is not None:
+            raise ValueError("SpatialPhaseMapEncoder does not support timestep conditioning")
         if sample.dim() != 4 or int(sample.shape[1]) != self.input_channels:
             raise ValueError(
                 f"sample must be [B,{self.input_channels},H,W], got {tuple(sample.shape)}"
@@ -215,173 +299,31 @@ class ConditionalPhaseSLMEncoder(nn.Module):
                 f"got {(height, width)}"
             )
 
-        conditioned_sample = sample.to(dtype=torch.float32)
-        features: list[torch.Tensor] = []
-        if self.time_conditional:
-            if timesteps is None:
-                raise ValueError("timesteps must be provided when time_conditional=True")
-            if isinstance(timesteps, int):
-                timestep_tensor = torch.full((batch_size,), int(timesteps), device=sample.device, dtype=torch.long)
-            else:
-                timestep_tensor = timesteps.to(device=sample.device, dtype=torch.long).reshape(-1)
-            if int(timestep_tensor.shape[0]) != batch_size:
-                raise ValueError("timesteps batch size must match sample batch size")
-            features.append(self._encode_timesteps(timestep_tensor).to(dtype=sample.dtype))
-        elif timesteps is not None:
-            raise ValueError("timesteps must not be provided when time_conditional=False")
-
+        condition_repr: torch.Tensor | None = None
         resolved_condition = class_labels if condition is None else condition
-        if self.condition_mode is not None:
+        if self.condition_layer is not None:
             if resolved_condition is None:
                 raise ValueError("condition must be provided when conditioning is enabled")
-            if self.condition_embedding is None:
-                raise RuntimeError("condition embedding is not initialized")
-            condition_embedding = self.condition_embedding(resolved_condition.to(device=sample.device))
-            if int(condition_embedding.shape[0]) != batch_size:
+            condition_repr = self.condition_layer(resolved_condition.to(device=sample.device))
+            if int(condition_repr.shape[0]) != batch_size:
                 raise ValueError("condition batch size must match sample batch size")
-            condition_map = condition_embedding.view(batch_size, self.class_condition_channels, 1, 1)
-            condition_map = condition_map.expand(-1, -1, self.input_height, self.input_width)
-            conditioned_sample = torch.cat((conditioned_sample, condition_map.to(dtype=conditioned_sample.dtype)), dim=1)
         elif class_labels is not None or condition is not None:
             raise ValueError("condition must not be provided when conditioning is disabled")
 
-        features.insert(0, conditioned_sample.reshape(batch_size, -1))
-        hidden = torch.cat(features, dim=1)
-        hidden = self.act(self.fc1(hidden))
-        hidden = self.act(self.fc2(hidden))
-        raw_phase = self.fc3(hidden).reshape(batch_size, 1, self.output_height, self.output_width)
-        return torch.remainder(raw_phase, self.phase_period_rad)
-
-
-class PhaseMapEncoder(nn.Module):
-    """Map a fused latent representation [B, D] to an SLM phase map."""
-
-    def __init__(
-        self,
-        *,
-        input_dim: int,
-        output_height: int,
-        output_width: int,
-        hidden_dim: int = 512,
-        phase_alpha_pi: float = 2.0,
-        weight_init: str = "kaiming_uniform",
-        output_weight_init: str = "xavier_uniform",
-        apply_wrap: bool = True,
-    ) -> None:
-        super().__init__()
-        self.input_dim = int(input_dim)
-        self.output_height = int(output_height)
-        self.output_width = int(output_width)
-        self.hidden_dim = int(hidden_dim)
-        self.phase_alpha_pi = float(phase_alpha_pi)
-        self.weight_init = str(weight_init)
-        self.output_weight_init = str(output_weight_init)
-        self.apply_wrap = bool(apply_wrap)
-
-        if self.input_dim <= 0:
-            raise ValueError(f"input_dim must be positive, got {input_dim!r}")
-        if self.output_height <= 0 or self.output_width <= 0:
-            raise ValueError("output_height and output_width must be positive")
-        if self.hidden_dim <= 0:
-            raise ValueError(f"hidden_dim must be positive, got {hidden_dim!r}")
-
-        output_dim = self.output_height * self.output_width
-        self.fc1 = nn.Linear(self.input_dim, self.hidden_dim)
-        self.fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.fc3 = nn.Linear(self.hidden_dim, output_dim)
-        self.act = nn.SiLU()
-        self._reset_parameters()
-
-    @property
-    def phase_period_rad(self) -> float:
-        return float(self.phase_alpha_pi * math.pi)
-
-    def _init_linear(self, layer: nn.Linear, mode: str) -> None:
-        if mode == "kaiming_uniform":
-            init.kaiming_uniform_(layer.weight, nonlinearity="relu")
-        elif mode == "kaiming_normal":
-            init.kaiming_normal_(layer.weight, nonlinearity="relu")
-        elif mode == "xavier_uniform":
-            init.xavier_uniform_(layer.weight)
-        elif mode == "xavier_normal":
-            init.xavier_normal_(layer.weight)
-        else:
-            raise ValueError(f"Unsupported phase map encoder init mode: {mode!r}")
-        if layer.bias is not None:
-            init.zeros_(layer.bias)
-
-    def _reset_parameters(self) -> None:
-        self._init_linear(self.fc1, self.weight_init)
-        self._init_linear(self.fc2, self.weight_init)
-        self._init_linear(self.fc3, self.output_weight_init)
-
-    def forward(self, fused_repr: torch.Tensor) -> torch.Tensor:
-        if fused_repr.dim() != 2 or int(fused_repr.shape[1]) != self.input_dim:
-            raise ValueError(
-                f"fused_repr must be [B,{self.input_dim}], got {tuple(fused_repr.shape)}"
-            )
-        hidden = fused_repr.to(dtype=torch.float32)
-        hidden = self.act(self.fc1(hidden))
-        hidden = self.act(self.fc2(hidden))
-        raw_phase = self.fc3(hidden).reshape(hidden.shape[0], 1, self.output_height, self.output_width)
+        hidden = self.stem(sample.to(dtype=torch.float32))
+        for index, block in enumerate(self.blocks):
+            target_size = self.stage_sizes[index]
+            hidden = _interpolate_like(hidden, size=target_size, mode=self.upsample_mode)
+            hidden = block(hidden, condition_repr)
+        raw_phase = self.head(hidden)
+        raw_phase = _interpolate_like(
+            raw_phase,
+            size=(self.output_height, self.output_width),
+            mode=self.upsample_mode,
+        )
         if self.apply_wrap:
             return torch.remainder(raw_phase, self.phase_period_rad)
         return raw_phase
-
-
-class LatentPhaseMapEncoder(nn.Module):
-    """latent -> latent embedding -> optional condition fusion -> phase map."""
-
-    def __init__(
-        self,
-        *,
-        latent_layer: LatentEmbeddingLayer,
-        phase_map_encoder: PhaseMapEncoder,
-        condition_layer: ConditionEmbeddingLayer | None = None,
-        fusion_layer: ConditionalLatentFusion | None = None,
-    ) -> None:
-        super().__init__()
-        self.latent_layer = latent_layer
-        self.phase_map_encoder = phase_map_encoder
-        self.condition_layer = condition_layer
-        self.fusion_layer = fusion_layer
-
-    @property
-    def output_height(self) -> int:
-        return self.phase_map_encoder.output_height
-
-    @property
-    def output_width(self) -> int:
-        return self.phase_map_encoder.output_width
-
-    @property
-    def phase_period_rad(self) -> float:
-        return self.phase_map_encoder.phase_period_rad
-
-    def forward(
-        self,
-        sample: torch.Tensor,
-        *,
-        timesteps: torch.Tensor | int | None = None,
-        class_labels: torch.Tensor | None = None,
-        condition: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if timesteps is not None:
-            raise ValueError("LatentPhaseMapEncoder does not support timestep conditioning")
-        latent_repr = self.latent_layer(sample)
-        if self.condition_layer is None:
-            if class_labels is not None or condition is not None:
-                raise ValueError("condition must not be provided when conditioning is disabled")
-            fused_repr = latent_repr
-        else:
-            resolved_condition = class_labels if condition is None else condition
-            if resolved_condition is None:
-                raise ValueError("condition must be provided when conditioning is enabled")
-            if self.fusion_layer is None:
-                raise RuntimeError("fusion_layer must be provided when conditioning is enabled")
-            condition_repr = self.condition_layer(resolved_condition.to(device=latent_repr.device))
-            fused_repr = self.fusion_layer(latent_repr, condition_repr)
-        return self.phase_map_encoder(fused_repr)
 
 
 class OpticalPrefixReadoutDecoder(nn.Module):

@@ -12,17 +12,14 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from conditioning import ConditionEmbeddingLayer
 from optical.core import DetectorConfig, PropagationConfig, PropagationErrorConfig, SourceConfig
 from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.models import (
-    ConditionEmbeddingLayer,
-    ConditionalPhaseSLMEncoder,
-    LatentPhaseMapEncoder,
     OpticalMultiscaleModel,
     OpticalPrefixReadoutDecoder,
-    PhaseMapEncoder,
+    SpatialPhaseMapEncoder,
 )
-from conditioning import ConditionalLatentFusion, ContinuousMapLatentProjector, LatentEmbeddingLayer
 
 
 def _default_propagation_config() -> PropagationConfig:
@@ -38,143 +35,58 @@ def _default_propagation_config() -> PropagationConfig:
 
 
 class OpticalMultiscaleModelTests(unittest.TestCase):
-    def test_condition_embedding_layer_supports_attribute_vectors(self) -> None:
-        layer = ConditionEmbeddingLayer(
-            mode="attribute_vector",
-            input_dim=5,
-            output_dim=3,
-            hidden_dim=7,
-        )
-        output = layer(torch.tensor([[1.0, 0.0, 1.0, 0.0, 1.0]], dtype=torch.float32))
-        self.assertEqual(tuple(output.shape), (1, 3))
-        self.assertTrue(torch.isfinite(output).all().item())
-
-    def test_encoder_supports_explicit_weight_initialization(self) -> None:
-        encoder = ConditionalPhaseSLMEncoder(
-            input_channels=1,
-            input_height=4,
-            input_width=4,
-            output_height=4,
-            output_width=4,
-            hidden_dim=16,
-            class_conditional=True,
-            num_classes=10,
-            class_embed_dim=8,
-            class_condition_channels=2,
-            weight_init="xavier_uniform",
-            output_weight_init="xavier_uniform",
-            embedding_init_std=0.01,
-        )
-
-        self.assertEqual(tuple(encoder.fc1.weight.shape), (16, 48))
-        self.assertTrue(torch.isfinite(encoder.fc1.weight).all().item())
-        self.assertTrue(torch.isfinite(encoder.fc3.weight).all().item())
-        self.assertIsNotNone(encoder.condition_embedding)
-        embedding = getattr(encoder.condition_embedding, "embedding", None)
-        self.assertIsNotNone(embedding)
-        self.assertLess(float(embedding.weight.std()), 0.05)
-
-    def test_conditional_phase_slm_encoder_supports_time_and_class_embeddings(self) -> None:
-        encoder = ConditionalPhaseSLMEncoder(
-            input_channels=1,
+    def test_spatial_phase_map_encoder_supports_attribute_conditions(self) -> None:
+        encoder = SpatialPhaseMapEncoder(
+            input_channels=4,
             input_height=2,
             input_width=2,
-            output_height=3,
-            output_width=3,
-            hidden_dim=32,
+            output_height=8,
+            output_width=8,
+            hidden_dim=48,
+            hidden_channels=(32, 24, 16),
             phase_alpha_pi=2.0,
-            time_conditional=True,
-            time_embedding_type="positional",
-            time_embedding_dim=16,
-            class_conditional=True,
-            num_classes=10,
-            class_embed_dim=8,
-        )
-        sample = torch.tensor(
-            [
-                [[[0.0, 0.5], [1.0, 0.25]]],
-                [[[0.1, 0.2], [0.3, 0.4]]],
-            ],
-            dtype=torch.float32,
-        )
-        timesteps = torch.tensor([1, 5], dtype=torch.long)
-        class_labels = torch.tensor([2, 7], dtype=torch.long)
-
-        phase_map = encoder(sample, timesteps=timesteps, class_labels=class_labels)
-        phase_map_other = encoder(sample, timesteps=timesteps, class_labels=torch.tensor([1, 1], dtype=torch.long))
-
-        self.assertEqual(tuple(phase_map.shape), (2, 1, 3, 3))
-        self.assertTrue(torch.all(phase_map >= 0.0).item())
-        self.assertTrue(torch.all(phase_map < encoder.phase_period_rad).item())
-        self.assertFalse(torch.allclose(phase_map, phase_map_other))
-
-    def test_conditional_phase_slm_encoder_supports_attribute_conditions(self) -> None:
-        encoder = ConditionalPhaseSLMEncoder(
-            input_channels=1,
-            input_height=4,
-            input_width=4,
-            output_height=4,
-            output_width=4,
-            hidden_dim=32,
-            condition_mode="attribute_vector",
-            condition_input_dim=5,
-            class_condition_channels=3,
-        )
-        sample = torch.zeros((2, 1, 4, 4), dtype=torch.float32)
-        cond_a = torch.tensor([[1, 0, 1, 0, 1], [0, 1, 0, 1, 0]], dtype=torch.float32)
-        cond_b = torch.tensor([[0, 0, 0, 0, 0], [1, 1, 1, 1, 1]], dtype=torch.float32)
-        phase_a = encoder(sample, condition=cond_a)
-        phase_b = encoder(sample, condition=cond_b)
-        self.assertEqual(tuple(phase_a.shape), (2, 1, 4, 4))
-        self.assertFalse(torch.allclose(phase_a, phase_b))
-
-    def test_phase_map_encoder_projects_vector_to_phase_map(self) -> None:
-        encoder = PhaseMapEncoder(
-            input_dim=12,
-            output_height=4,
-            output_width=5,
-            hidden_dim=16,
-            phase_alpha_pi=2.0,
-        )
-        output = encoder(torch.rand((3, 12), dtype=torch.float32))
-        self.assertEqual(tuple(output.shape), (3, 1, 4, 5))
-        self.assertTrue(torch.all(output >= 0.0).item())
-        self.assertTrue(torch.all(output < encoder.phase_period_rad).item())
-
-    def test_latent_phase_map_encoder_supports_continuous_latent_and_condition(self) -> None:
-        encoder = LatentPhaseMapEncoder(
-            latent_layer=LatentEmbeddingLayer(
-                projector=ContinuousMapLatentProjector(
-                    input_dim=16,
-                    output_dim=10,
-                    hidden_dim=12,
-                )
-            ),
             condition_layer=ConditionEmbeddingLayer(
                 mode="attribute_vector",
                 input_dim=5,
-                output_dim=10,
-                hidden_dim=12,
-            ),
-            fusion_layer=ConditionalLatentFusion(
-                latent_dim=10,
-                condition_dim=10,
-                output_dim=14,
-                mode="concat",
+                output_dim=12,
                 hidden_dim=16,
             ),
-            phase_map_encoder=PhaseMapEncoder(
-                input_dim=14,
-                output_height=4,
-                output_width=4,
-                hidden_dim=16,
-                phase_alpha_pi=2.0,
+            condition_dim=12,
+            upsample_mode="bilinear",
+        )
+        sample = torch.rand((2, 4, 2, 2), dtype=torch.float32)
+        cond_a = torch.tensor([[1, 0, 1, 0, 1], [0, 1, 0, 1, 0]], dtype=torch.float32)
+        cond_b = torch.tensor([[0, 0, 0, 0, 0], [1, 1, 1, 1, 1]], dtype=torch.float32)
+
+        phase_a = encoder(sample, condition=cond_a)
+        phase_b = encoder(sample, condition=cond_b)
+
+        self.assertEqual(tuple(phase_a.shape), (2, 1, 8, 8))
+        self.assertTrue(torch.all(phase_a >= 0.0).item())
+        self.assertTrue(torch.all(phase_a < encoder.phase_period_rad).item())
+        self.assertFalse(torch.allclose(phase_a, phase_b))
+
+    def test_spatial_phase_map_encoder_supports_class_labels(self) -> None:
+        encoder = SpatialPhaseMapEncoder(
+            input_channels=1,
+            input_height=4,
+            input_width=4,
+            output_height=4,
+            output_width=4,
+            hidden_dim=32,
+            condition_layer=ConditionEmbeddingLayer(
+                mode="class_index",
+                num_classes=10,
+                output_dim=8,
+                embed_dim=6,
             ),
+            condition_dim=8,
         )
-        output = encoder(
-            torch.rand((2, 1, 4, 4), dtype=torch.float32),
-            condition=torch.tensor([[1, 0, 1, 0, 1], [0, 1, 0, 1, 0]], dtype=torch.float32),
-        )
+        sample = torch.rand((2, 1, 4, 4), dtype=torch.float32)
+        labels = torch.tensor([2, 7], dtype=torch.long)
+
+        output = encoder(sample, class_labels=labels)
+
         self.assertEqual(tuple(output.shape), (2, 1, 4, 4))
         self.assertTrue(torch.isfinite(output).all().item())
 
@@ -244,7 +156,7 @@ class OpticalMultiscaleModelTests(unittest.TestCase):
         self.assertEqual(len(outputs["prefix_readouts"]), 2)
         self.assertTrue(torch.allclose(outputs["prefix_readout_2"], outputs["final_detector"], atol=1e-5))
 
-    def test_optical_multiscale_model_runs_end_to_end(self) -> None:
+    def test_optical_multiscale_model_runs_end_to_end_with_spatial_encoder(self) -> None:
         source_config = SourceConfig(
             wavelengths_m=(532e-9,),
             light_mode="phase",
@@ -299,21 +211,20 @@ class OpticalMultiscaleModelTests(unittest.TestCase):
                 shift_y_m=0.0,
             ),
         )
-        encoder = ConditionalPhaseSLMEncoder(
-            input_channels=1,
+        encoder = SpatialPhaseMapEncoder(
+            input_channels=4,
             input_height=2,
             input_width=2,
             output_height=2,
             output_width=2,
-            hidden_dim=16,
-            phase_alpha_pi=2.0,
+            hidden_dim=24,
         )
         model = OpticalMultiscaleModel(
             encoder=encoder,
             optical_decoder=decoder,
             upsample_mode="nearest",
         )
-        sample = torch.tensor([[[[0.0, 0.5], [0.25, 1.0]]]], dtype=torch.float32)
+        sample = torch.rand((1, 4, 2, 2), dtype=torch.float32)
 
         outputs = model(sample)
 
