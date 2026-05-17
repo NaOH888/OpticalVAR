@@ -371,6 +371,33 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             self.assertEqual(architecture, "legacy_rvq_flat")
             self.assertTrue(hasattr(model.encoder, "latent_layer"))
 
+    def test_discrete_latent_defaults_to_coarse_rvq_control_architecture(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, _, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["encoder"]["condition_mode"] = "attribute_vector"
+            config["encoder"]["condition_input_dim"] = 5
+            config["encoder"]["rvq_codebook_size"] = 16
+            config["encoder"]["rvq_code_embed_dim"] = 8
+            config["encoder"]["latent_embed_dim"] = 24
+            config["encoder"]["fused_dim"] = 20
+            sample_item = {
+                "target_final": torch.zeros((1, 8, 8), dtype=torch.float32),
+                "label": torch.zeros((5,), dtype=torch.float32),
+                "latent": torch.tensor([1, 2, 3, 4], dtype=torch.long),
+            }
+
+            architecture = _infer_encoder_architecture(config, sample_item=sample_item)
+            model = _build_model(
+                config,
+                sample_item=sample_item,
+                architecture_override=architecture,
+            )
+
+            self.assertEqual(architecture, "coarse_rvq_control")
+            self.assertEqual(type(model.encoder).__name__, "CoarseRVQControlEncoder")
+
     def test_dataset_builder_can_load_cutoffs_from_json_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

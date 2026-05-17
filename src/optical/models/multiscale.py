@@ -266,6 +266,7 @@ class PhaseMapEncoder(nn.Module):
         phase_alpha_pi: float = 2.0,
         weight_init: str = "kaiming_uniform",
         output_weight_init: str = "xavier_uniform",
+        apply_wrap: bool = True,
     ) -> None:
         super().__init__()
         self.input_dim = int(input_dim)
@@ -275,6 +276,7 @@ class PhaseMapEncoder(nn.Module):
         self.phase_alpha_pi = float(phase_alpha_pi)
         self.weight_init = str(weight_init)
         self.output_weight_init = str(output_weight_init)
+        self.apply_wrap = bool(apply_wrap)
 
         if self.input_dim <= 0:
             raise ValueError(f"input_dim must be positive, got {input_dim!r}")
@@ -322,7 +324,9 @@ class PhaseMapEncoder(nn.Module):
         hidden = self.act(self.fc1(hidden))
         hidden = self.act(self.fc2(hidden))
         raw_phase = self.fc3(hidden).reshape(hidden.shape[0], 1, self.output_height, self.output_width)
-        return torch.remainder(raw_phase, self.phase_period_rad)
+        if self.apply_wrap:
+            return torch.remainder(raw_phase, self.phase_period_rad)
+        return raw_phase
 
 
 class LatentPhaseMapEncoder(nn.Module):
@@ -378,6 +382,74 @@ class LatentPhaseMapEncoder(nn.Module):
             condition_repr = self.condition_layer(resolved_condition.to(device=latent_repr.device))
             fused_repr = self.fusion_layer(latent_repr, condition_repr)
         return self.phase_map_encoder(fused_repr)
+
+
+class CoarseRVQControlEncoder(nn.Module):
+    """使用较低自由度的粗相位控制图，再上采样到最终 SLM 尺寸。"""
+
+    def __init__(
+        self,
+        *,
+        latent_layer: LatentEmbeddingLayer,
+        coarse_phase_map_encoder: PhaseMapEncoder,
+        output_height: int,
+        output_width: int,
+        upsample_mode: str = "bilinear",
+        condition_layer: ConditionEmbeddingLayer | None = None,
+        fusion_layer: ConditionalLatentFusion | None = None,
+    ) -> None:
+        super().__init__()
+        self.latent_layer = latent_layer
+        self.coarse_phase_map_encoder = coarse_phase_map_encoder
+        self.output_height = int(output_height)
+        self.output_width = int(output_width)
+        self.upsample_mode = str(upsample_mode)
+        self.condition_layer = condition_layer
+        self.fusion_layer = fusion_layer
+        if self.output_height <= 0 or self.output_width <= 0:
+            raise ValueError("output_height and output_width must be positive")
+
+    @property
+    def phase_period_rad(self) -> float:
+        return self.coarse_phase_map_encoder.phase_period_rad
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        *,
+        timesteps: torch.Tensor | int | None = None,
+        class_labels: torch.Tensor | None = None,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if timesteps is not None:
+            raise ValueError("CoarseRVQControlEncoder does not support timestep conditioning")
+        latent_repr = self.latent_layer(sample)
+        if self.condition_layer is None:
+            if class_labels is not None or condition is not None:
+                raise ValueError("condition must not be provided when conditioning is disabled")
+            fused_repr = latent_repr
+        else:
+            resolved_condition = class_labels if condition is None else condition
+            if resolved_condition is None:
+                raise ValueError("condition must be provided when conditioning is enabled")
+            if self.fusion_layer is None:
+                raise RuntimeError("fusion_layer must be provided when conditioning is enabled")
+            condition_repr = self.condition_layer(resolved_condition.to(device=latent_repr.device))
+            fused_repr = self.fusion_layer(latent_repr, condition_repr)
+
+        coarse_phase = self.coarse_phase_map_encoder(fused_repr)
+        if (self.coarse_phase_map_encoder.output_height, self.coarse_phase_map_encoder.output_width) != (
+            self.output_height,
+            self.output_width,
+        ):
+            align_corners = False if self.upsample_mode in {"bilinear", "bicubic"} else None
+            coarse_phase = F.interpolate(
+                coarse_phase,
+                size=(self.output_height, self.output_width),
+                mode=self.upsample_mode,
+                align_corners=align_corners,
+            )
+        return torch.remainder(coarse_phase, self.phase_period_rad)
 
 
 class HierarchicalRVQPhaseMapEncoder(nn.Module):

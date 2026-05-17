@@ -22,6 +22,7 @@ from optical.data import FrequencyPathDataset, MultiScaleFrequencyTargetTransfor
 from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.losses import OpticalMultiscaleLoss
 from optical.models import (
+    CoarseRVQControlEncoder,
     HierarchicalRVQPhaseMapEncoder,
     LatentPhaseMapEncoder,
     OpticalMultiscaleModel,
@@ -211,6 +212,8 @@ def _infer_encoder_architecture(
         return str(explicit_architecture)
 
     if checkpoint_state is not None:
+        if any(key.startswith("encoder.coarse_phase_map_encoder.") for key in checkpoint_state):
+            return "coarse_rvq_control"
         if any(key.startswith("encoder.latent_layer.projector.embedding.") for key in checkpoint_state):
             return "legacy_rvq_flat"
         if any(key.startswith("encoder.code_embedding.") for key in checkpoint_state):
@@ -228,7 +231,7 @@ def _infer_encoder_architecture(
         torch.int64,
         torch.uint8,
     }:
-        return "hierarchical_rvq"
+        return "coarse_rvq_control"
     return "legacy_continuous"
 
 
@@ -365,7 +368,55 @@ def _build_model(
         codebook_size = encoder_cfg.get("rvq_codebook_size")
         if codebook_size is None:
             raise ValueError("encoder.rvq_codebook_size must be provided for discrete latent inputs")
-        if architecture == "hierarchical_rvq":
+        if architecture == "coarse_rvq_control":
+            fusion_layer = None
+            if condition_layer is not None:
+                fusion_layer = ConditionalLatentFusion(
+                    latent_dim=latent_embed_dim,
+                    condition_dim=condition_embed_dim,
+                    output_dim=fused_dim,
+                    mode=fusion_mode,
+                    hidden_dim=fusion_hidden_dim,
+                )
+                phase_input_dim = fused_dim
+            else:
+                phase_input_dim = latent_embed_dim
+            latent_projector = DiscreteCodeLatentProjector(
+                num_codebooks=discrete_shape,
+                codebook_size=int(codebook_size),
+                code_embed_dim=int(encoder_cfg.get("rvq_code_embed_dim", latent_embed_dim)),
+                output_dim=latent_embed_dim,
+                hidden_dim=encoder_cfg.get("latent_hidden_dim"),
+                fuse_codebooks=str(encoder_cfg.get("rvq_fuse_codebooks", "concat")),
+            )
+            output_height = int(encoder_cfg.get("output_height", slm.pixel_count_y))
+            output_width = int(encoder_cfg.get("output_width", slm.pixel_count_x))
+            control_height = encoder_cfg.get("rvq_control_height")
+            control_width = encoder_cfg.get("rvq_control_width")
+            control_divisor = max(int(encoder_cfg.get("rvq_control_divisor", 8)), 1)
+            if control_height is None:
+                control_height = max(output_height // control_divisor, 1)
+            if control_width is None:
+                control_width = max(output_width // control_divisor, 1)
+            encoder = CoarseRVQControlEncoder(
+                latent_layer=LatentEmbeddingLayer(projector=latent_projector),
+                condition_layer=condition_layer,
+                fusion_layer=fusion_layer,
+                coarse_phase_map_encoder=PhaseMapEncoder(
+                    input_dim=phase_input_dim,
+                    output_height=int(control_height),
+                    output_width=int(control_width),
+                    hidden_dim=int(encoder_cfg.get("hidden_dim", 512)),
+                    phase_alpha_pi=float(encoder_cfg.get("phase_alpha_pi", 2.0)),
+                    weight_init=str(encoder_cfg.get("weight_init", "kaiming_uniform")),
+                    output_weight_init=str(encoder_cfg.get("output_weight_init", "xavier_uniform")),
+                    apply_wrap=False,
+                ),
+                output_height=output_height,
+                output_width=output_width,
+                upsample_mode=str(encoder_cfg.get("upsample_mode", "bilinear")),
+            )
+        elif architecture == "hierarchical_rvq":
             encoder = HierarchicalRVQPhaseMapEncoder(
                 num_codebooks=discrete_shape,
                 codebook_size=int(codebook_size),
