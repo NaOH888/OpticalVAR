@@ -16,6 +16,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from scripts.train_optical_multiscale import (
     _build_dataset_and_loader,
+    _infer_encoder_architecture,
     _build_model,
     _build_model_inputs,
     _move_batch_to_device,
@@ -317,6 +318,35 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             self.assertEqual(latent.dtype, torch.long)
             self.assertEqual(int(labels[0]), 3)
             self.assertEqual(tuple(outputs["encoder_output"].shape), (2, 1, 8, 8))
+
+    def test_legacy_rvq_checkpoint_keys_select_legacy_encoder_architecture(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, _, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["encoder"]["rvq_codebook_size"] = 16
+            sample_item = {
+                "target_final": torch.zeros((1, 8, 8), dtype=torch.float32),
+                "latent": torch.tensor([1, 2, 3, 4], dtype=torch.long),
+                "label": torch.tensor(3, dtype=torch.long),
+            }
+            checkpoint_state = {
+                "encoder.latent_layer.projector.embedding.0.weight": torch.zeros((16, 8), dtype=torch.float32),
+            }
+
+            architecture = _infer_encoder_architecture(
+                config,
+                sample_item=sample_item,
+                checkpoint_state=checkpoint_state,
+            )
+            model = _build_model(
+                config,
+                sample_item=sample_item,
+                architecture_override=architecture,
+            )
+
+            self.assertEqual(architecture, "legacy_rvq_flat")
+            self.assertTrue(hasattr(model.encoder, "latent_layer"))
 
     def test_dataset_builder_can_load_cutoffs_from_json_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
