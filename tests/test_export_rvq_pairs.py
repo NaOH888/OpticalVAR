@@ -89,6 +89,7 @@ class ExportRVQPairsTests(unittest.TestCase):
             self.assertEqual(payload["num_items"], 8)
             self.assertEqual(len(payload["npz_files"]), 2)
             self.assertTrue((output_dir / payload["latent_spec"]["rvq_model_file"]).exists())
+            self.assertEqual(payload["image_manifest_path"], "../dataset/tiny_gray.json")
             self.assertEqual(payload["label_names"], ["attr_a", "attr_b", "left_eye_x", "left_eye_y"])
             self.assertEqual(payload["condition_components"]["total_dim"], 4)
 

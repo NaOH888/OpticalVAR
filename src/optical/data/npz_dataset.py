@@ -3,6 +3,7 @@ from __future__ import annotations
 import bisect
 import json
 from pathlib import Path
+from pathlib import PureWindowsPath
 
 import numpy as np
 import torch
@@ -268,7 +269,14 @@ class ReferencedImageLatentDataset(Dataset):
         image_manifest_path = payload.get("image_manifest_path")
         if image_manifest_path is None:
             raise KeyError("latent manifest must contain image_manifest_path")
-        image_manifest = (manifest_file.parent / str(image_manifest_path)).resolve()
+        image_manifest_raw = str(image_manifest_path)
+        # RVQ manifests may be generated on Windows and later consumed on Linux.
+        # Normalize backslash-based relative paths before resolving them.
+        if "\\" in image_manifest_raw:
+            image_manifest_rel = Path(PureWindowsPath(image_manifest_raw))
+        else:
+            image_manifest_rel = Path(image_manifest_raw)
+        image_manifest = (manifest_file.parent / image_manifest_rel).resolve()
         image_dataset = NpzImageDataset.from_manifest(
             image_manifest,
             max_items=max_items,

@@ -212,6 +212,65 @@ class NpzDatasetTests(unittest.TestCase):
             self.assertTrue(torch.allclose(sample["label"], torch.tensor([0.0, 1.0])))
             dataset.close()
 
+    def test_referenced_image_latent_dataset_accepts_windows_style_manifest_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            image_dir = tmp_path / "dataset"
+            image_dir.mkdir(parents=True, exist_ok=True)
+            image_npz = image_dir / "images.npz"
+            image_manifest = image_dir / "images.json"
+            latent_npz = tmp_path / "rvq.npz"
+            latent_manifest = tmp_path / "rvq.json"
+
+            np.savez(
+                image_npz,
+                images=np.ones((1, 1, 4, 4), dtype=np.float32),
+                labels=np.array([[1, 0]], dtype=np.float32),
+                sample_ids=np.array([10], dtype=np.int64),
+            )
+            image_manifest.write_text(
+                json.dumps(
+                    {
+                        "image_key": "images",
+                        "label_key": "labels",
+                        "sample_id_key": "sample_ids",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            np.savez(
+                latent_npz,
+                rvq_codes=np.array([[1, 2, 3]], dtype=np.int64),
+                labels=np.array([[1, 0]], dtype=np.float32),
+                sample_ids=np.array([10], dtype=np.int64),
+            )
+            latent_manifest.write_text(
+                json.dumps(
+                    {
+                        "image_manifest_path": "dataset\\images.json",
+                        "image_key": None,
+                        "label_key": "labels",
+                        "latent_source": "rvq",
+                        "latent_type": "discrete_code",
+                        "latent_key": "rvq_codes",
+                        "sample_id_key": "sample_ids",
+                        "latent_spec": {
+                            "num_stages": 3,
+                            "codebook_size": 256,
+                            "shape": [3],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            dataset = ReferencedImageLatentDataset.from_latent_manifest(latent_manifest)
+            sample = dataset[0]
+            self.assertEqual(int(sample["sample_id"]), 10)
+            self.assertEqual(tuple(sample["latent"].shape), (3,))
+            dataset.close()
+
 
 if __name__ == "__main__":
     unittest.main()

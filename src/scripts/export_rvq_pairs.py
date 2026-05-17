@@ -311,10 +311,12 @@ def _save_rvq_shards(
         "dataset_name": f"{config['dataset'].get('dataset_name', 'dataset')}_rvq_pairs",
         "split": str(config["dataset"].get("split", "train")),
         "num_items": int(rvq_codes.shape[0]),
-        "image_manifest_path": os.path.relpath(
-            str(image_manifest.resolve()),
-            start=str(output_manifest.parent.resolve()),
-        ),
+        "image_manifest_path": Path(
+            os.path.relpath(
+                str(image_manifest.resolve()),
+                start=str(output_manifest.parent.resolve()),
+            )
+        ).as_posix(),
         "image_key": None,
         "label_key": "labels",
         "sample_id_key": "sample_ids",
