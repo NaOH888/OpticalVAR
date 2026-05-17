@@ -19,7 +19,6 @@ if __package__ in {None, ""}:
 from scripts.train_optical_multiscale import (
     _build_dataset_and_loader,
     _build_model,
-    _infer_encoder_architecture,
 )
 
 
@@ -171,16 +170,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         candidate_samples = [dataset[index] for index in candidate_indices]
 
-        architecture_override = _infer_encoder_architecture(
-            config,
-            sample_item=anchor_sample,
-            checkpoint_state=checkpoint["model"],
-        )
-        model = _build_model(
-            config,
-            sample_item=anchor_sample,
-            architecture_override=architecture_override,
-        ).to(device)
+        model = _build_model(config, sample_item=anchor_sample).to(device)
         model.load_state_dict(checkpoint["model"], strict=True)
         model.eval()
 

@@ -19,7 +19,6 @@ from scripts.train_optical_multiscale import (
     _build_dataset_and_loader,
     _build_model,
     _build_model_inputs,
-    _infer_encoder_architecture,
     _move_batch_to_device,
 )
 
@@ -360,16 +359,7 @@ def main(argv: list[str] | None = None) -> None:
             "target_final": _make_dummy_target_from_config(config),
         }
 
-    architecture_override = _infer_encoder_architecture(
-        config,
-        sample_item=sample_item,
-        checkpoint_state=checkpoint["model"],
-    )
-    model = _build_model(
-        config,
-        sample_item=sample_item,
-        architecture_override=architecture_override,
-    ).to(device)
+    model = _build_model(config, sample_item=sample_item).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
 
