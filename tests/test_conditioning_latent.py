@@ -16,7 +16,6 @@ from conditioning import (
     ConditionalLatentFusion,
     ConditionalLatentInputAdapter,
     ContinuousMapLatentProjector,
-    DiscreteCodeLatentProjector,
     LatentEmbeddingLayer,
 )
 
@@ -35,21 +34,6 @@ class ConditioningLatentTests(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (2, 12))
         self.assertTrue(torch.isfinite(output).all())
 
-    def test_discrete_code_embedding_projects_to_vector(self) -> None:
-        layer = LatentEmbeddingLayer(
-            projector=DiscreteCodeLatentProjector(
-                num_codebooks=4,
-                codebook_size=16,
-                code_embed_dim=8,
-                output_dim=12,
-                hidden_dim=20,
-                fuse_codebooks="concat",
-            )
-        )
-        output = layer(torch.tensor([[1, 2, 3, 4], [0, 5, 7, 9]], dtype=torch.long))
-        self.assertEqual(tuple(output.shape), (2, 12))
-        self.assertTrue(torch.isfinite(output).all())
-
     def test_condition_latent_adapter_returns_all_representations(self) -> None:
         condition_layer = ConditionEmbeddingLayer(
             mode="attribute_vector",
@@ -58,10 +42,8 @@ class ConditioningLatentTests(unittest.TestCase):
             hidden_dim=12,
         )
         latent_layer = LatentEmbeddingLayer(
-            projector=DiscreteCodeLatentProjector(
-                num_codebooks=3,
-                codebook_size=8,
-                code_embed_dim=6,
+            projector=ContinuousMapLatentProjector(
+                input_dim=12,
                 output_dim=10,
                 hidden_dim=12,
             )
@@ -79,7 +61,7 @@ class ConditioningLatentTests(unittest.TestCase):
             fusion_layer=fusion_layer,
         )
         result = adapter(
-            latent=torch.tensor([[1, 2, 3], [0, 4, 5]], dtype=torch.long),
+            latent=torch.rand((2, 3, 2, 2), dtype=torch.float32),
             condition=torch.tensor([[1, 0, 1, 0, 1], [0, 1, 0, 1, 0]], dtype=torch.float32),
         )
         self.assertEqual(tuple(result["latent_repr"].shape), (2, 10))

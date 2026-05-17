@@ -13,7 +13,7 @@ if __package__ in {None, ""}:
     if str(SRC_ROOT) not in sys.path:
         sys.path.insert(0, str(SRC_ROOT))
 
-from optical.data import NpzImageDataset, ReferencedImageLatentDataset
+from optical.data import NpzImageDataset
 
 
 def _resolve_path(path_value: str, *, cwd: Path) -> Path:
@@ -29,13 +29,6 @@ def _load_image_dataset(
     channel_mode: str,
     max_items: int | None,
 ) -> Any:
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if "image_manifest_path" in payload:
-        return ReferencedImageLatentDataset.from_latent_manifest(
-            manifest_path,
-            max_items=max_items,
-            channel_mode=channel_mode,
-        )
     return NpzImageDataset.from_manifest(
         manifest_path,
         max_items=max_items,

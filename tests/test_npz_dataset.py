@@ -14,25 +14,20 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from optical.data import NpzImageDataset, ReferencedImageLatentDataset
+from optical.data import NpzImageDataset
 
 
 class NpzDatasetTests(unittest.TestCase):
     def test_from_manifest_can_reduce_rgb_to_single_channel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            npz_path = tmp_path / "tiny.json".replace(".json", ".npz")
+            npz_path = tmp_path / "tiny.npz"
             manifest_path = tmp_path / "tiny.json"
             images = np.arange(2 * 3 * 4 * 4, dtype=np.float32).reshape(2, 3, 4, 4)
             labels = np.array([1, 5], dtype=np.int64)
             np.savez(npz_path, images=images, labels=labels)
             manifest_path.write_text(
-                json.dumps(
-                    {
-                        "image_key": "images",
-                        "label_key": "labels"
-                    }
-                ),
+                json.dumps({"image_key": "images", "label_key": "labels"}),
                 encoding="utf-8",
             )
 
@@ -46,21 +41,23 @@ class NpzDatasetTests(unittest.TestCase):
             self.assertTrue(torch.allclose(sample["image"][0], torch.as_tensor(images[0, 0])))
             dataset.close()
 
-    def test_from_manifest_can_return_latent_tensor(self) -> None:
+    def test_from_manifest_can_return_continuous_latent_tensor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             npz_path = tmp_path / "tiny_pairs.npz"
             manifest_path = tmp_path / "tiny_pairs.json"
             images = np.ones((2, 1, 4, 4), dtype=np.float32)
             labels = np.array([2, 7], dtype=np.int64)
-            latents = np.arange(2 * 1 * 2 * 2, dtype=np.float32).reshape(2, 1, 2, 2)
+            latents = np.arange(2 * 4 * 2 * 2, dtype=np.float32).reshape(2, 4, 2, 2)
             np.savez(npz_path, teacher_images=images, labels=labels, latents=latents)
             manifest_path.write_text(
                 json.dumps(
                     {
                         "image_key": "teacher_images",
                         "label_key": "labels",
-                        "latent_key": "latents"
+                        "latent_source": "autoencoderkl",
+                        "latent_type": "continuous_map",
+                        "latent_key": "latents",
                     }
                 ),
                 encoding="utf-8",
@@ -69,47 +66,13 @@ class NpzDatasetTests(unittest.TestCase):
             dataset = NpzImageDataset.from_manifest(manifest_path)
             sample = dataset[1]
 
+            self.assertEqual(dataset.latent_source, "autoencoderkl")
+            self.assertEqual(dataset.latent_type, "continuous_map")
             self.assertEqual(tuple(sample["image"].shape), (1, 4, 4))
-            self.assertEqual(tuple(sample["latent"].shape), (1, 2, 2))
+            self.assertEqual(tuple(sample["latent"].shape), (4, 2, 2))
+            self.assertEqual(sample["latent"].dtype, torch.float32)
             self.assertEqual(int(sample["label"]), 7)
             self.assertTrue(torch.allclose(sample["latent"], torch.as_tensor(latents[1])))
-            dataset.close()
-
-    def test_from_manifest_can_return_rvq_codes_as_integer_latent(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            npz_path = tmp_path / "tiny_rvq.npz"
-            manifest_path = tmp_path / "tiny_rvq.json"
-            images = np.ones((2, 1, 4, 4), dtype=np.float32)
-            labels = np.array([2, 7], dtype=np.int64)
-            rvq_codes = np.array([[1, 5, 9], [3, 4, 8]], dtype=np.int64)
-            np.savez(npz_path, teacher_images=images, labels=labels, rvq_codes=rvq_codes)
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "image_key": "teacher_images",
-                        "label_key": "labels",
-                        "latent_source": "rvq",
-                        "latent_type": "discrete_code",
-                        "latent_key": "rvq_codes",
-                        "latent_spec": {
-                            "num_stages": 3,
-                            "codebook_size": 256,
-                            "shape": [3],
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            dataset = NpzImageDataset.from_manifest(manifest_path)
-            sample = dataset[1]
-
-            self.assertEqual(dataset.latent_source, "rvq")
-            self.assertEqual(dataset.latent_type, "discrete_code")
-            self.assertEqual(tuple(sample["latent"].shape), (3,))
-            self.assertEqual(sample["latent"].dtype, torch.long)
-            self.assertTrue(torch.equal(sample["latent"], torch.tensor([3, 4, 8], dtype=torch.long)))
             dataset.close()
 
     def test_from_manifest_can_read_sharded_npz_files(self) -> None:
@@ -149,126 +112,6 @@ class NpzDatasetTests(unittest.TestCase):
             self.assertEqual(tuple(sample["image"].shape), (1, 2, 2))
             self.assertEqual(int(sample["sample_id"]), 12)
             self.assertTrue(torch.allclose(sample["label"], torch.tensor([1.0, 1.0])))
-            dataset.close()
-
-    def test_referenced_image_latent_dataset_can_join_image_and_rvq_manifests(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            image_npz = tmp_path / "images.npz"
-            image_manifest = tmp_path / "images.json"
-            latent_npz = tmp_path / "rvq.npz"
-            latent_manifest = tmp_path / "rvq.json"
-
-            np.savez(
-                image_npz,
-                images=np.ones((2, 1, 4, 4), dtype=np.float32),
-                labels=np.array([[1, 0], [0, 1]], dtype=np.float32),
-                sample_ids=np.array([10, 11], dtype=np.int64),
-            )
-            image_manifest.write_text(
-                json.dumps(
-                    {
-                        "image_key": "images",
-                        "label_key": "labels",
-                        "sample_id_key": "sample_ids",
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            np.savez(
-                latent_npz,
-                rvq_codes=np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int64),
-                labels=np.array([[1, 0], [0, 1]], dtype=np.float32),
-                sample_ids=np.array([10, 11], dtype=np.int64),
-            )
-            latent_manifest.write_text(
-                json.dumps(
-                    {
-                        "image_manifest_path": image_manifest.name,
-                        "image_key": None,
-                        "label_key": "labels",
-                        "latent_source": "rvq",
-                        "latent_type": "discrete_code",
-                        "latent_key": "rvq_codes",
-                        "sample_id_key": "sample_ids",
-                        "latent_spec": {
-                            "num_stages": 3,
-                            "codebook_size": 256,
-                            "shape": [3],
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            dataset = ReferencedImageLatentDataset.from_latent_manifest(latent_manifest)
-            sample = dataset[1]
-
-            self.assertEqual(tuple(sample["image"].shape), (1, 4, 4))
-            self.assertEqual(tuple(sample["latent"].shape), (3,))
-            self.assertEqual(sample["latent"].dtype, torch.long)
-            self.assertEqual(int(sample["sample_id"]), 11)
-            self.assertTrue(torch.allclose(sample["label"], torch.tensor([0.0, 1.0])))
-            dataset.close()
-
-    def test_referenced_image_latent_dataset_accepts_windows_style_manifest_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            image_dir = tmp_path / "dataset"
-            image_dir.mkdir(parents=True, exist_ok=True)
-            image_npz = image_dir / "images.npz"
-            image_manifest = image_dir / "images.json"
-            latent_npz = tmp_path / "rvq.npz"
-            latent_manifest = tmp_path / "rvq.json"
-
-            np.savez(
-                image_npz,
-                images=np.ones((1, 1, 4, 4), dtype=np.float32),
-                labels=np.array([[1, 0]], dtype=np.float32),
-                sample_ids=np.array([10], dtype=np.int64),
-            )
-            image_manifest.write_text(
-                json.dumps(
-                    {
-                        "image_key": "images",
-                        "label_key": "labels",
-                        "sample_id_key": "sample_ids",
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            np.savez(
-                latent_npz,
-                rvq_codes=np.array([[1, 2, 3]], dtype=np.int64),
-                labels=np.array([[1, 0]], dtype=np.float32),
-                sample_ids=np.array([10], dtype=np.int64),
-            )
-            latent_manifest.write_text(
-                json.dumps(
-                    {
-                        "image_manifest_path": "dataset\\images.json",
-                        "image_key": None,
-                        "label_key": "labels",
-                        "latent_source": "rvq",
-                        "latent_type": "discrete_code",
-                        "latent_key": "rvq_codes",
-                        "sample_id_key": "sample_ids",
-                        "latent_spec": {
-                            "num_stages": 3,
-                            "codebook_size": 256,
-                            "shape": [3],
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            dataset = ReferencedImageLatentDataset.from_latent_manifest(latent_manifest)
-            sample = dataset[0]
-            self.assertEqual(int(sample["sample_id"]), 10)
-            self.assertEqual(tuple(sample["latent"].shape), (3,))
             dataset.close()
 
 

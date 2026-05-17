@@ -56,67 +56,6 @@ class ContinuousMapLatentProjector(nn.Module):
         return self.projector(features).to(dtype=torch.float32)
 
 
-class DiscreteCodeLatentProjector(nn.Module):
-    """将 RVQ 等离散 code 序列查表并融合成统一的 latent 表示向量。"""
-
-    def __init__(
-        self,
-        *,
-        output_dim: int,
-        num_codebooks: int,
-        codebook_size: int,
-        code_embed_dim: int | None = None,
-        hidden_dim: int | None = None,
-        fuse_codebooks: str = "sum",
-    ) -> None:
-        super().__init__()
-        self.output_dim = int(output_dim)
-        self.num_codebooks = int(num_codebooks)
-        self.codebook_size = int(codebook_size)
-        self.code_embed_dim = int(code_embed_dim if code_embed_dim is not None else output_dim)
-        self.hidden_dim = int(hidden_dim if hidden_dim is not None else max(self.output_dim, self.code_embed_dim))
-        self.fuse_codebooks = str(fuse_codebooks)
-        if self.output_dim <= 0:
-            raise ValueError(f"output_dim must be positive, got {output_dim!r}")
-        if self.num_codebooks <= 0:
-            raise ValueError("num_codebooks must be positive")
-        if self.codebook_size <= 0:
-            raise ValueError("codebook_size must be positive")
-        if self.fuse_codebooks not in {"sum", "concat"}:
-            raise ValueError("fuse_codebooks must be one of {'sum', 'concat'}")
-
-        self.embedding = nn.ModuleList(
-            nn.Embedding(self.codebook_size, self.code_embed_dim) for _ in range(self.num_codebooks)
-        )
-        projected_dim = self.code_embed_dim if self.fuse_codebooks == "sum" else self.code_embed_dim * self.num_codebooks
-        self.projector = (
-            nn.Identity()
-            if projected_dim == self.output_dim
-            else nn.Sequential(
-                nn.Linear(projected_dim, self.hidden_dim),
-                nn.SiLU(),
-                nn.Linear(self.hidden_dim, self.output_dim),
-            )
-        )
-
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        # 输入是 [B, L] 的离散 code，其中 L 对应 codebook stage 数。
-        codes = latent.to(dtype=torch.long)
-        if codes.dim() == 1:
-            codes = codes.unsqueeze(0)
-        if codes.dim() != 2:
-            raise ValueError(f"discrete latent must be [B,L] or [L], got {tuple(codes.shape)}")
-        if int(codes.shape[1]) != self.num_codebooks:
-            raise ValueError(f"discrete latent length must be {self.num_codebooks}, got {int(codes.shape[1])}")
-        # 每一级 code 先独立查 embedding，再按配置求和或拼接。
-        embedded = [layer(codes[:, index]) for index, layer in enumerate(self.embedding)]
-        if self.fuse_codebooks == "sum":
-            fused = torch.stack(embedded, dim=0).sum(dim=0)
-        else:
-            fused = torch.cat(embedded, dim=1)
-        return self.projector(fused).to(dtype=torch.float32)
-
-
 class LatentEmbeddingLayer(nn.Module):
     """对外统一的 latent 嵌入层，具体嵌入方式由注入的 projector 决定。"""
 

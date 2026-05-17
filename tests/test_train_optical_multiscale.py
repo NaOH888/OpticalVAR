@@ -311,55 +311,6 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             self.assertEqual(int(labels[0]), 3)
             self.assertEqual(int(labels[1]), 5)
 
-    def test_discrete_latent_codes_are_accepted_by_model_inputs_and_builder(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            _, _, config_path = self._write_tiny_training_case(tmp_path)
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["encoder"]["rvq_codebook_size"] = 16
-            sample_item = {
-                "target_final": torch.zeros((1, 8, 8), dtype=torch.float32),
-                "latent": torch.tensor([1, 2, 3, 4], dtype=torch.long),
-                "label": torch.tensor(3, dtype=torch.long),
-            }
-            model = _build_model(config, sample_item=sample_item).to(torch.device("cpu"))
-            batch = {
-                "target_final": torch.zeros((2, 1, 8, 8), dtype=torch.float32),
-                "latent": torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]], dtype=torch.long),
-                "label": torch.tensor([3, 5], dtype=torch.long),
-            }
-
-            latent, labels = _build_model_inputs(
-                batch,
-                model=model,
-                config=config,
-                device=torch.device("cpu"),
-            )
-            outputs = model(latent, class_labels=labels)
-
-            self.assertEqual(latent.dtype, torch.long)
-            self.assertEqual(int(labels[0]), 3)
-            self.assertEqual(tuple(outputs["encoder_output"].shape), (2, 1, 8, 8))
-
-    def test_discrete_latent_uses_coarse_rvq_control_architecture(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            _, _, config_path = self._write_tiny_training_case(tmp_path)
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["encoder"]["condition_mode"] = "attribute_vector"
-            config["encoder"]["condition_input_dim"] = 5
-            config["encoder"]["rvq_codebook_size"] = 16
-            config["encoder"]["rvq_code_embed_dim"] = 8
-            config["encoder"]["latent_embed_dim"] = 24
-            config["encoder"]["fused_dim"] = 20
-            sample_item = {
-                "target_final": torch.zeros((1, 8, 8), dtype=torch.float32),
-                "label": torch.zeros((5,), dtype=torch.float32),
-                "latent": torch.tensor([1, 2, 3, 4], dtype=torch.long),
-            }
-            model = _build_model(config, sample_item=sample_item)
-            self.assertEqual(type(model.encoder).__name__, "CoarseRVQControlEncoder")
-
     def test_dataset_builder_can_load_cutoffs_from_json_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

@@ -3,7 +3,6 @@ from __future__ import annotations
 import bisect
 import json
 from pathlib import Path
-from pathlib import PureWindowsPath
 
 import numpy as np
 import torch
@@ -50,14 +49,14 @@ class NpzImageDataset(Dataset):
                 "channel_mode must be one of {'keep', 'first', 'mean'}, "
                 f"got {self.channel_mode!r}"
             )
-        if self.latent_source is not None and self.latent_source not in {"cvae", "rvq", "autoencoderkl"}:
+        if self.latent_source is not None and self.latent_source not in {"cvae", "autoencoderkl"}:
             raise ValueError(
-                "latent_source must be one of {'cvae', 'rvq', 'autoencoderkl'} when provided, "
+                "latent_source must be one of {'cvae', 'autoencoderkl'} when provided, "
                 f"got {self.latent_source!r}"
             )
-        if self.latent_type is not None and self.latent_type not in {"continuous_map", "discrete_code"}:
+        if self.latent_type is not None and self.latent_type not in {"continuous_map"}:
             raise ValueError(
-                "latent_type must be one of {'continuous_map', 'discrete_code'} when provided, "
+                "latent_type must be 'continuous_map' when provided, "
                 f"got {self.latent_type!r}"
             )
 
@@ -233,87 +232,5 @@ class NpzImageDataset(Dataset):
                 sample["label"] = torch.as_tensor(label_value, dtype=self.dtype)
         if self.latents is not None and len(self.latents) > 0:
             latent_value = self.latents[shard_index][local_index]
-            if self.latent_type == "discrete_code":
-                sample["latent"] = torch.as_tensor(latent_value, dtype=torch.long)
-            else:
-                sample["latent"] = torch.as_tensor(latent_value, dtype=self.dtype)
+            sample["latent"] = torch.as_tensor(latent_value, dtype=self.dtype)
         return sample
-
-
-class ReferencedImageLatentDataset(Dataset):
-    """Combine an image manifest and a latent-only manifest aligned by sample_id and order."""
-
-    def __init__(
-        self,
-        image_dataset: NpzImageDataset,
-        latent_dataset: NpzImageDataset,
-    ) -> None:
-        self.image_dataset = image_dataset
-        self.latent_dataset = latent_dataset
-        if len(self.image_dataset) != len(self.latent_dataset):
-            raise ValueError(
-                f"image and latent dataset lengths must match, got {len(self.image_dataset)} vs {len(self.latent_dataset)}"
-            )
-
-    @classmethod
-    def from_latent_manifest(
-        cls,
-        manifest_path: str | Path,
-        *,
-        max_items: int | None = None,
-        dtype: torch.dtype = torch.float32,
-        channel_mode: str = "keep",
-    ) -> "ReferencedImageLatentDataset":
-        manifest_file = Path(manifest_path)
-        payload = json.loads(manifest_file.read_text(encoding="utf-8"))
-        image_manifest_path = payload.get("image_manifest_path")
-        if image_manifest_path is None:
-            raise KeyError("latent manifest must contain image_manifest_path")
-        image_manifest_raw = str(image_manifest_path)
-        # RVQ manifests may be generated on Windows and later consumed on Linux.
-        # Normalize backslash-based relative paths before resolving them.
-        if "\\" in image_manifest_raw:
-            image_manifest_rel = Path(PureWindowsPath(image_manifest_raw))
-        else:
-            image_manifest_rel = Path(image_manifest_raw)
-        image_manifest = (manifest_file.parent / image_manifest_rel).resolve()
-        image_dataset = NpzImageDataset.from_manifest(
-            image_manifest,
-            max_items=max_items,
-            dtype=dtype,
-            channel_mode=channel_mode,
-        )
-        latent_dataset = NpzImageDataset.from_manifest(
-            manifest_file,
-            max_items=max_items,
-            dtype=dtype,
-            channel_mode=channel_mode,
-        )
-        return cls(image_dataset=image_dataset, latent_dataset=latent_dataset)
-
-    def close(self) -> None:
-        self.image_dataset.close()
-        self.latent_dataset.close()
-
-    def __len__(self) -> int:
-        return len(self.image_dataset)
-
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        image_sample = self.image_dataset[index]
-        latent_sample = self.latent_dataset[index]
-        image_sample_id = int(image_sample["sample_id"])
-        latent_sample_id = int(latent_sample["sample_id"])
-        if image_sample_id != latent_sample_id:
-            raise ValueError(
-                f"image and latent sample_id mismatch at index {index}: {image_sample_id} vs {latent_sample_id}"
-            )
-        output = {
-            "image": image_sample["image"],
-            "sample_id": image_sample["sample_id"],
-            "latent": latent_sample["latent"],
-        }
-        if "label" in latent_sample:
-            output["label"] = latent_sample["label"]
-        elif "label" in image_sample:
-            output["label"] = image_sample["label"]
-        return output

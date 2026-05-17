@@ -15,7 +15,6 @@ if str(SRC_ROOT) not in sys.path:
 from optical.core import DetectorConfig, PropagationConfig, PropagationErrorConfig, SourceConfig
 from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.models import (
-    CoarseRVQControlEncoder,
     ConditionEmbeddingLayer,
     ConditionalPhaseSLMEncoder,
     LatentPhaseMapEncoder,
@@ -23,7 +22,7 @@ from optical.models import (
     OpticalPrefixReadoutDecoder,
     PhaseMapEncoder,
 )
-from conditioning import ConditionalLatentFusion, ContinuousMapLatentProjector, DiscreteCodeLatentProjector, LatentEmbeddingLayer
+from conditioning import ConditionalLatentFusion, ContinuousMapLatentProjector, LatentEmbeddingLayer
 
 
 def _default_propagation_config() -> PropagationConfig:
@@ -142,13 +141,11 @@ class OpticalMultiscaleModelTests(unittest.TestCase):
         self.assertTrue(torch.all(output >= 0.0).item())
         self.assertTrue(torch.all(output < encoder.phase_period_rad).item())
 
-    def test_latent_phase_map_encoder_supports_discrete_codes_and_condition(self) -> None:
+    def test_latent_phase_map_encoder_supports_continuous_latent_and_condition(self) -> None:
         encoder = LatentPhaseMapEncoder(
             latent_layer=LatentEmbeddingLayer(
-                projector=DiscreteCodeLatentProjector(
-                    num_codebooks=4,
-                    codebook_size=16,
-                    code_embed_dim=8,
+                projector=ContinuousMapLatentProjector(
+                    input_dim=16,
                     output_dim=10,
                     hidden_dim=12,
                 )
@@ -175,59 +172,11 @@ class OpticalMultiscaleModelTests(unittest.TestCase):
             ),
         )
         output = encoder(
-            torch.tensor([[1, 2, 3, 4], [0, 5, 7, 9]], dtype=torch.long),
+            torch.rand((2, 1, 4, 4), dtype=torch.float32),
             condition=torch.tensor([[1, 0, 1, 0, 1], [0, 1, 0, 1, 0]], dtype=torch.float32),
         )
         self.assertEqual(tuple(output.shape), (2, 1, 4, 4))
         self.assertTrue(torch.isfinite(output).all().item())
-
-    def test_coarse_rvq_control_encoder_projects_to_low_res_phase_then_upsamples(self) -> None:
-        encoder = CoarseRVQControlEncoder(
-            latent_layer=LatentEmbeddingLayer(
-                projector=DiscreteCodeLatentProjector(
-                    num_codebooks=32,
-                    codebook_size=32,
-                    code_embed_dim=8,
-                    output_dim=24,
-                    hidden_dim=32,
-                    fuse_codebooks="concat",
-                )
-            ),
-            condition_layer=ConditionEmbeddingLayer(
-                mode="attribute_vector",
-                input_dim=5,
-                output_dim=10,
-                hidden_dim=12,
-            ),
-            fusion_layer=ConditionalLatentFusion(
-                latent_dim=24,
-                condition_dim=10,
-                output_dim=20,
-                mode="concat",
-                hidden_dim=16,
-            ),
-            coarse_phase_map_encoder=PhaseMapEncoder(
-                input_dim=20,
-                output_height=22,
-                output_width=22,
-                hidden_dim=32,
-                phase_alpha_pi=2.0,
-                apply_wrap=False,
-            ),
-            output_height=176,
-            output_width=176,
-            upsample_mode="bilinear",
-        )
-
-        output = encoder(
-            torch.arange(32, dtype=torch.long).unsqueeze(0) % 32,
-            condition=torch.tensor([[1, 0, 1, 0, 1]], dtype=torch.float32),
-        )
-
-        self.assertEqual(tuple(output.shape), (1, 1, 176, 176))
-        self.assertTrue(torch.isfinite(output).all().item())
-        self.assertTrue(torch.all(output >= 0.0).item())
-        self.assertTrue(torch.all(output < encoder.phase_period_rad).item())
 
     def test_prefix_readout_decoder_returns_detector_plane_prefixes(self) -> None:
         source_config = SourceConfig(

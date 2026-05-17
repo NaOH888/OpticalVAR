@@ -19,16 +19,14 @@ from scripts.train_optical_multiscale import _build_dataset_and_loader, _build_m
 
 
 class DiagnoseOpticalLatentUsageScriptTests(unittest.TestCase):
-    def _write_tiny_rvq_case(self, tmp_path: Path) -> tuple[Path, Path]:
+    def _write_tiny_continuous_case(self, tmp_path: Path) -> tuple[Path, Path]:
         dataset_dir = tmp_path / "dataset"
         dataset_dir.mkdir(parents=True, exist_ok=True)
-        image_npz = dataset_dir / "tiny_gray.npz"
-        image_manifest = dataset_dir / "tiny_gray.json"
-        latent_npz = dataset_dir / "tiny_rvq.npz"
-        latent_manifest = dataset_dir / "tiny_rvq.json"
+        latent_npz = dataset_dir / "tiny_autoencoderkl.npz"
+        latent_manifest = dataset_dir / "tiny_autoencoderkl.json"
         checkpoint_path = tmp_path / "latest.pt"
 
-        images = np.linspace(0.0, 1.0, num=4 * 1 * 8 * 8, dtype=np.float32).reshape(4, 1, 8, 8)
+        teacher_images = np.linspace(0.0, 1.0, num=4 * 1 * 8 * 8, dtype=np.float32).reshape(4, 1, 8, 8)
         labels = np.array(
             [
                 [1.0, 0.0],
@@ -38,51 +36,32 @@ class DiagnoseOpticalLatentUsageScriptTests(unittest.TestCase):
             ],
             dtype=np.float32,
         )
+        latents = np.linspace(0.0, 1.0, num=4 * 4 * 2 * 2, dtype=np.float32).reshape(4, 4, 2, 2)
         sample_ids = np.arange(4, dtype=np.int64)
-        rvq_codes = np.array(
-            [
-                [1, 2, 3],
-                [3, 2, 1],
-                [1, 1, 2],
-                [2, 3, 3],
-            ],
-            dtype=np.int64,
-        )
 
-        np.savez(image_npz, images=images, labels=labels, sample_ids=sample_ids)
-        image_manifest.write_text(
-            json.dumps(
-                {
-                    "dataset_name": "tiny",
-                    "split": "train",
-                    "image_key": "images",
-                    "label_key": "labels",
-                    "sample_id_key": "sample_ids",
-                    "npz_files": [image_npz.name],
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+        np.savez(
+            latent_npz,
+            teacher_images=teacher_images,
+            latents=latents,
+            labels=labels,
+            sample_ids=sample_ids,
         )
-
-        np.savez(latent_npz, rvq_codes=rvq_codes, labels=labels, sample_ids=sample_ids)
         latent_manifest.write_text(
             json.dumps(
                 {
-                    "dataset_name": "tiny_rvq",
+                    "dataset_name": "tiny_autoencoderkl",
                     "split": "train",
-                    "image_manifest_path": image_manifest.name,
-                    "image_key": None,
+                    "image_key": "teacher_images",
                     "label_key": "labels",
                     "sample_id_key": "sample_ids",
-                    "latent_source": "rvq",
-                    "latent_type": "discrete_code",
-                    "latent_key": "rvq_codes",
+                    "latent_source": "autoencoderkl",
+                    "latent_type": "continuous_map",
+                    "latent_key": "latents",
                     "latent_spec": {
-                        "num_stages": 3,
-                        "codebook_size": 8,
-                        "shape": [3],
-                        "embedding_dim": 6,
+                        "shape": [4, 2, 2],
+                        "model_id": "fake/sd-vae",
+                        "latent_mode": "mode",
+                        "scaling_factor": 0.18215,
                     },
                     "npz_files": [latent_npz.name],
                 },
@@ -116,9 +95,6 @@ class DiagnoseOpticalLatentUsageScriptTests(unittest.TestCase):
                 "fused_dim": 20,
                 "fusion_mode": "concat",
                 "fusion_hidden_dim": 24,
-                "rvq_codebook_size": 8,
-                "rvq_code_embed_dim": 6,
-                "rvq_fuse_codebooks": "sum",
                 "condition_mode": "attribute_vector",
                 "condition_input_dim": 2,
                 "class_embed_dim": 8,
@@ -224,10 +200,10 @@ class DiagnoseOpticalLatentUsageScriptTests(unittest.TestCase):
 
         return checkpoint_path, latent_manifest
 
-    def test_diagnose_script_runs_for_referenced_rvq_manifest(self) -> None:
+    def test_diagnose_script_runs_for_continuous_latent_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            checkpoint_path, latent_manifest = self._write_tiny_rvq_case(tmp_path)
+            checkpoint_path, latent_manifest = self._write_tiny_continuous_case(tmp_path)
             output_dir = tmp_path / "diagnose_outputs"
 
             diagnose_main(
@@ -257,7 +233,6 @@ class DiagnoseOpticalLatentUsageScriptTests(unittest.TestCase):
             self.assertEqual(payload["anchor_index"], 0)
             self.assertEqual(len(payload["latent_only"]), 2)
             self.assertEqual(len(payload["condition_only"]), 2)
-            self.assertEqual(len(payload["rvq_stage_sensitivity"]), 3)
             self.assertIsInstance(payload["anchor_label"], list)
 
 

@@ -221,37 +221,6 @@ def main(argv: list[str] | None = None) -> None:
             condition_final_images.append(condition_outputs["final_detector"])
             condition_phase_images.append(condition_outputs["encoder_output"])
 
-        stage_sensitivity: list[dict[str, Any]] = []
-        if anchor_latent.dtype == torch.long and anchor_latent.dim() == 1:
-            for stage_idx in range(int(anchor_latent.shape[0])):
-                per_stage_results: list[dict[str, Any]] = []
-                for sample_index, sample in zip(candidate_indices, candidate_samples):
-                    mutated_latent = anchor_latent.clone()
-                    mutated_latent[stage_idx] = sample["latent"][stage_idx].to(device=device)
-                    mutated_outputs = _run_model(
-                        model,
-                        latent=mutated_latent,
-                        condition=anchor_condition,
-                    )
-                    per_stage_results.append(
-                        {
-                            "sample_index": int(sample_index),
-                            "sample_id": int(sample["sample_id"]),
-                            "encoder_output_mad": _mean_abs_diff(anchor_outputs["encoder_output"], mutated_outputs["encoder_output"]),
-                            "slm_input_mad": _mean_abs_diff(anchor_outputs["slm_input"], mutated_outputs["slm_input"]),
-                            "final_detector_mad": _mean_abs_diff(anchor_outputs["final_detector"], mutated_outputs["final_detector"]),
-                        }
-                    )
-                stage_sensitivity.append(
-                    {
-                        "stage_index": stage_idx,
-                        "mean_encoder_output_mad": float(sum(item["encoder_output_mad"] for item in per_stage_results) / len(per_stage_results)),
-                        "mean_slm_input_mad": float(sum(item["slm_input_mad"] for item in per_stage_results) / len(per_stage_results)),
-                        "mean_final_detector_mad": float(sum(item["final_detector_mad"] for item in per_stage_results) / len(per_stage_results)),
-                        "samples": per_stage_results,
-                    }
-                )
-
         _save_panel(
             args.output_dir / "anchor_target.png",
             title="anchor_target",
@@ -314,7 +283,6 @@ def main(argv: list[str] | None = None) -> None:
             },
             "latent_only": latent_only_results,
             "condition_only": condition_only_results,
-            "rvq_stage_sensitivity": stage_sensitivity,
         }
         (args.output_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, ensure_ascii=False),
