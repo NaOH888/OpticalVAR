@@ -160,6 +160,10 @@ def _reconstruct_image(
     return image
 
 
+def _mean_abs_error(lhs: np.ndarray, rhs: np.ndarray) -> float:
+    return float(np.abs(lhs.astype(np.float32, copy=False) - rhs.astype(np.float32, copy=False)).mean())
+
+
 def analyze_rvq_capacity(
     *,
     manifest_path: Path,
@@ -198,6 +202,10 @@ def analyze_rvq_capacity(
             swap_stages = sorted(set([0, min(1, num_stages - 1), num_stages - 1]))
 
         projected_image = _project_image(flat_image, pca_components=pca_components, pca_mean=pca_mean)
+        pca_only_flat = _inverse_project_feature(projected_image, pca_components=pca_components, pca_mean=pca_mean)
+        pca_only_image = pca_only_flat.reshape(image_shape).astype(np.float32, copy=False)
+        if pca_only_image.ndim == 3 and pca_only_image.shape[0] == 1:
+            pca_only_image = pca_only_image[0]
 
         cumulative_images: list[np.ndarray] = []
         cumulative_titles: list[str] = []
@@ -224,6 +232,20 @@ def analyze_rvq_capacity(
 
         original_image = image[0] if image.ndim == 3 and image.shape[0] == 1 else image
         donor_display = donor_image[0] if donor_image.ndim == 3 and donor_image.shape[0] == 1 else donor_image
+        full_reconstruction = _reconstruct_image(
+            codes,
+            rvq_codebooks=rvq_codebooks,
+            pca_components=pca_components,
+            pca_mean=pca_mean,
+            image_shape=image_shape,
+        )
+        full_reconstruction_flat = full_reconstruction.reshape(-1)
+        _save_image_grid(
+            [original_image, pca_only_image, full_reconstruction],
+            ["anchor_original", "pca_only_recon", "rvq_full_recon"],
+            output_dir / "pca_vs_rvq_full.png",
+            cols=3,
+        )
         _save_image_grid(
             [original_image, donor_display] + cumulative_images,
             ["anchor_original", "donor_original"] + cumulative_titles,
@@ -240,14 +262,6 @@ def analyze_rvq_capacity(
         )
         _save_curve(residual_norms, output_dir / "residual_curve.png", title="RVQ Residual Norm", ylabel="L2 norm")
 
-        full_reconstruction = _reconstruct_image(
-            codes,
-            rvq_codebooks=rvq_codebooks,
-            pca_components=pca_components,
-            pca_mean=pca_mean,
-            image_shape=image_shape,
-        )
-        full_reconstruction_flat = full_reconstruction.reshape(-1)
         swap_images: list[np.ndarray] = []
         swap_titles: list[str] = []
         swap_diffs: list[np.ndarray] = []
@@ -309,6 +323,9 @@ def analyze_rvq_capacity(
             "pca_dim": int(pca_components.shape[0]),
             "cumulative_stage_counts": [int(value) for value in cumulative_stage_counts],
             "swap_stages": [int(value) for value in swap_stages],
+            "pca_only_mad_to_original": _mean_abs_error(pca_only_flat, flat_image),
+            "rvq_full_mad_to_original": _mean_abs_error(full_reconstruction_flat, flat_image),
+            "rvq_vs_pca_only_mad": _mean_abs_error(full_reconstruction_flat, pca_only_flat),
             "residual_norms": residual_norms,
             "swap_summary": swap_summary,
         }
