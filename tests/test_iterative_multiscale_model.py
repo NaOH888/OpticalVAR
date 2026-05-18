@@ -173,6 +173,30 @@ class IterativeMultiscaleModelTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(output_a, output_b))
 
+    def test_iterative_encoder_step1_ignores_prev_image_even_when_enabled(self) -> None:
+        torch.manual_seed(7)
+        encoder = IterativeMultiscaleEncoder(
+            latent_channels=4,
+            latent_height=2,
+            latent_width=2,
+            output_height=8,
+            output_width=8,
+            num_steps=4,
+            step_embedding_dim=8,
+            latent_stage_channels=(24, 16, 12),
+            prev_image_channels=(12, 8),
+            use_prev_image=True,
+            fusion_hidden_dim=16,
+        )
+        latent = torch.rand((2, 4, 2, 2), dtype=torch.float32)
+        prev_a = torch.zeros((2, 1, 8, 8), dtype=torch.float32)
+        prev_b = torch.ones((2, 1, 8, 8), dtype=torch.float32)
+
+        output_a = encoder(prev_image=prev_a, latent=latent, timesteps=0)
+        output_b = encoder(prev_image=prev_b, latent=latent, timesteps=0)
+
+        self.assertTrue(torch.allclose(output_a, output_b))
+
 
 if __name__ == "__main__":
     unittest.main()

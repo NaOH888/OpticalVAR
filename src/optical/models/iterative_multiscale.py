@@ -4,7 +4,6 @@ from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from conditioning import ConditionEmbeddingLayer
 from optical.models.multiscale import (
@@ -68,7 +67,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         if self.condition_layer is None and self.condition_embed_dim is not None:
             raise ValueError("condition_embed_dim must be omitted when condition_layer is disabled")
         if self.condition_layer is not None and (self.condition_embed_dim is None or self.condition_embed_dim <= 0):
-            raise ValueError("condition_embed_dim must be positive when condition_layer is enabled")
+            raise ValueError("condition_embed_dim must be positive when conditioning is enabled")
 
         self.stage_sizes = _build_spatial_stage_sizes(
             input_height=self.latent_height,
@@ -88,39 +87,8 @@ class IterativeMultiscaleEncoder(nn.Module):
         if not prev_channels or any(value <= 0 for value in prev_channels):
             raise ValueError("prev_image_channels must contain positive integers")
         self.prev_image_channels = prev_channels
-        prev_feature_channels = list(reversed(self.prev_image_channels))
-        while len(prev_feature_channels) < len(self.stage_sizes):
-            prev_feature_channels.insert(0, prev_feature_channels[0])
-        self.prev_feature_channels = tuple(prev_feature_channels[: len(self.stage_sizes)])
 
         self.latent_stem = nn.Conv2d(self.latent_channels, self.latent_stage_channels[0], kernel_size=1, bias=True)
-        if self.use_prev_image:
-            self.prev_stem = nn.Conv2d(1, self.prev_image_channels[0], kernel_size=3, stride=1, padding=1, bias=True)
-            prev_blocks: list[nn.Module] = []
-            for in_channels, out_channels in zip(self.prev_image_channels[:-1], self.prev_image_channels[1:]):
-                prev_blocks.append(
-                    nn.Sequential(
-                        nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
-                        nn.GroupNorm(num_groups=1, num_channels=out_channels),
-                        nn.SiLU(),
-                    )
-                )
-            self.prev_blocks = nn.ModuleList(prev_blocks)
-            self.prev_projectors = nn.ModuleList(
-                [
-                    nn.Conv2d(
-                        self.prev_feature_channels[index],
-                        self.latent_stage_channels[index],
-                        kernel_size=1,
-                        bias=True,
-                    )
-                    for index in range(len(self.stage_sizes))
-                ]
-            )
-        else:
-            self.prev_stem = None
-            self.prev_blocks = None
-            self.prev_projectors = None
         self.stage_projectors = nn.ModuleList(
             [
                 nn.Identity()
@@ -143,7 +111,7 @@ class IterativeMultiscaleEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(self.fusion_hidden_dim, self.fusion_hidden_dim),
         )
-        self.blocks = nn.ModuleList(
+        self.shared_blocks = nn.ModuleList(
             [
                 _DepthwisePointwiseBlock(
                     in_channels=self.latent_stage_channels[index],
@@ -153,32 +121,66 @@ class IterativeMultiscaleEncoder(nn.Module):
                 for index in range(len(self.stage_sizes))
             ]
         )
-        self.head = nn.Conv2d(self.latent_stage_channels[-1], 1, kernel_size=1, bias=True)
+        self.init_head = nn.Conv2d(self.latent_stage_channels[-1], 1, kernel_size=1, bias=True)
+
+        if self.use_prev_image:
+            self.prev_stem = nn.Conv2d(1, self.prev_image_channels[0], kernel_size=3, stride=1, padding=1, bias=True)
+            prev_blocks: list[nn.Module] = []
+            for in_channels, out_channels in zip(self.prev_image_channels[:-1], self.prev_image_channels[1:]):
+                prev_blocks.append(
+                    nn.Sequential(
+                        nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
+                        nn.GroupNorm(num_groups=1, num_channels=out_channels),
+                        nn.SiLU(),
+                    )
+                )
+            self.prev_blocks = nn.ModuleList(prev_blocks)
+            self.prev_projector = nn.Conv2d(
+                self.prev_image_channels[-1],
+                self.latent_stage_channels[-1],
+                kernel_size=1,
+                bias=True,
+            )
+            self.refine_block = _DepthwisePointwiseBlock(
+                in_channels=self.latent_stage_channels[-1],
+                out_channels=self.latent_stage_channels[-1],
+                condition_dim=self.fusion_hidden_dim,
+            )
+        else:
+            self.prev_stem = None
+            self.prev_blocks = None
+            self.prev_projector = None
+            self.refine_block = None
+        self.refine_head = nn.Conv2d(self.latent_stage_channels[-1], 1, kernel_size=1, bias=True)
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
         _init_linear_or_conv(self.latent_stem, self.weight_init)
-        if self.prev_stem is not None:
-            _init_linear_or_conv(self.prev_stem, self.weight_init)
-        if self.prev_blocks is not None:
-            for block in self.prev_blocks:
-                conv = block[0]
-                _init_linear_or_conv(conv, self.weight_init)
-        if self.prev_projectors is not None:
-            for projector in self.prev_projectors:
-                _init_linear_or_conv(projector, self.weight_init)
         for projector in self.stage_projectors:
             if isinstance(projector, nn.Conv2d):
                 _init_linear_or_conv(projector, self.weight_init)
         for module in self.conditioning_projector:
             if isinstance(module, nn.Linear):
                 _init_linear_or_conv(module, self.weight_init)
-        for block in self.blocks:
+        for block in self.shared_blocks:
             _init_linear_or_conv(block.depthwise, self.weight_init)
             _init_linear_or_conv(block.pointwise, self.weight_init)
             if block.modulation is not None:
                 _init_linear_or_conv(block.modulation.projector, self.weight_init)
-        _init_linear_or_conv(self.head, self.output_weight_init)
+        if self.prev_stem is not None:
+            _init_linear_or_conv(self.prev_stem, self.weight_init)
+        if self.prev_blocks is not None:
+            for block in self.prev_blocks:
+                _init_linear_or_conv(block[0], self.weight_init)
+        if self.prev_projector is not None:
+            _init_linear_or_conv(self.prev_projector, self.weight_init)
+        if self.refine_block is not None:
+            _init_linear_or_conv(self.refine_block.depthwise, self.weight_init)
+            _init_linear_or_conv(self.refine_block.pointwise, self.weight_init)
+            if self.refine_block.modulation is not None:
+                _init_linear_or_conv(self.refine_block.modulation.projector, self.weight_init)
+        _init_linear_or_conv(self.init_head, self.output_weight_init)
+        _init_linear_or_conv(self.refine_head, self.output_weight_init)
         if self.condition_layer is not None:
             embedding = getattr(self.condition_layer, "embedding", None)
             if isinstance(embedding, nn.Embedding):
@@ -190,22 +192,6 @@ class IterativeMultiscaleEncoder(nn.Module):
                 for module in projector:
                     if isinstance(module, nn.Linear):
                         _init_linear_or_conv(module, self.weight_init)
-
-    def _encode_prev_image(self, prev_image: torch.Tensor) -> list[torch.Tensor]:
-        if not self.use_prev_image or self.prev_stem is None or self.prev_blocks is None:
-            raise RuntimeError("_encode_prev_image should not be called when use_prev_image is disabled")
-        if prev_image.dim() != 4 or int(prev_image.shape[1]) != 1:
-            raise ValueError(f"prev_image must be [B,1,H,W], got {tuple(prev_image.shape)}")
-        hidden = self.prev_stem(prev_image.to(dtype=torch.float32))
-        features: list[torch.Tensor] = [hidden]
-        for block in self.prev_blocks:
-            hidden = F.avg_pool2d(hidden, kernel_size=2, stride=2)
-            hidden = block(hidden)
-            features.append(hidden)
-        low_to_high_features = list(reversed(features))
-        while len(low_to_high_features) < len(self.stage_sizes):
-            low_to_high_features.insert(0, low_to_high_features[0])
-        return low_to_high_features[: len(self.stage_sizes)]
 
     def encode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         if latent.dim() != 4 or int(latent.shape[1]) != self.latent_channels:
@@ -248,7 +234,6 @@ class IterativeMultiscaleEncoder(nn.Module):
         if int(timestep_tensor.shape[0]) != batch_size:
             raise ValueError("timestep batch size must match image batch size")
         timestep_repr = _build_positional_timestep_embedding(timestep_tensor, self.step_embedding_dim)
-
         if self.condition_layer is None:
             fused_input = timestep_repr
         else:
@@ -256,6 +241,41 @@ class IterativeMultiscaleEncoder(nn.Module):
                 raise ValueError("condition_base must be provided when conditioning is enabled")
             fused_input = torch.cat([condition_base, timestep_repr], dim=1)
         return self.conditioning_projector(fused_input.to(dtype=torch.float32))
+
+    @staticmethod
+    def _is_first_step(timesteps: torch.Tensor | int) -> bool:
+        if isinstance(timesteps, int):
+            return int(timesteps) == 0
+        return bool(torch.all(timesteps.reshape(-1) == 0).item())
+
+    def _forward_shared_features(
+        self,
+        *,
+        latent_base: torch.Tensor,
+        conditioning_repr: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = latent_base
+        for index, (target_size, block) in enumerate(zip(self.stage_sizes, self.shared_blocks)):
+            hidden = _interpolate_like(hidden, size=target_size, mode=self.upsample_mode)
+            hidden = self.stage_projectors[index](hidden)
+            hidden = block(hidden, conditioning_repr)
+        return hidden
+
+    def _encode_prev_image(self, prev_image: torch.Tensor) -> torch.Tensor:
+        if (
+            not self.use_prev_image
+            or self.prev_stem is None
+            or self.prev_blocks is None
+            or self.prev_projector is None
+        ):
+            raise RuntimeError("_encode_prev_image should not be called when use_prev_image is disabled")
+        if prev_image.dim() != 4 or int(prev_image.shape[1]) != 1:
+            raise ValueError(f"prev_image must be [B,1,H,W], got {tuple(prev_image.shape)}")
+        hidden = self.prev_stem(prev_image.to(dtype=torch.float32))
+        for block in self.prev_blocks:
+            hidden = block(hidden)
+        hidden = _interpolate_like(hidden, size=self.stage_sizes[-1], mode=self.upsample_mode)
+        return self.prev_projector(hidden)
 
     def forward_from_encoded(
         self,
@@ -271,23 +291,23 @@ class IterativeMultiscaleEncoder(nn.Module):
                 f"got {tuple(latent_base.shape)}"
             )
         batch_size = int(latent_base.shape[0])
-        prev_features = self._encode_prev_image(prev_image) if self.use_prev_image else None
         conditioning_repr = self._build_conditioning_repr_from_base(
             batch_size=batch_size,
             device=latent_base.device,
             timesteps=timesteps,
             condition_base=condition_base,
         )
-
-        hidden = latent_base
-        for index, (target_size, block) in enumerate(zip(self.stage_sizes, self.blocks)):
-            hidden = _interpolate_like(hidden, size=target_size, mode=self.upsample_mode)
-            hidden = self.stage_projectors[index](hidden)
-            if prev_features is not None and self.prev_projectors is not None:
-                prev_feature = _interpolate_like(prev_features[index], size=target_size, mode=self.upsample_mode)
-                hidden = hidden + self.prev_projectors[index](prev_feature)
-            hidden = block(hidden, conditioning_repr)
-        return self.head(hidden)
+        shared_features = self._forward_shared_features(
+            latent_base=latent_base,
+            conditioning_repr=conditioning_repr,
+        )
+        if self._is_first_step(timesteps) or not self.use_prev_image:
+            return self.init_head(shared_features)
+        if self.refine_block is None:
+            raise RuntimeError("refine_block must be initialized when use_prev_image is enabled")
+        prev_features = self._encode_prev_image(prev_image)
+        refined_features = self.refine_block(shared_features + prev_features, conditioning_repr)
+        return self.refine_head(refined_features)
 
     def forward(
         self,
