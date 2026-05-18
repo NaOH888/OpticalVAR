@@ -195,14 +195,39 @@ class IterativeMultiscaleEncoder(nn.Module):
             low_to_high_features.insert(0, low_to_high_features[0])
         return low_to_high_features[: len(self.stage_sizes)]
 
-    def _build_conditioning_repr(
+    def encode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        if latent.dim() != 4 or int(latent.shape[1]) != self.latent_channels:
+            raise ValueError(
+                f"latent must be [B,{self.latent_channels},H,W], got {tuple(latent.shape)}"
+            )
+        if tuple(latent.shape[-2:]) != (self.latent_height, self.latent_width):
+            raise ValueError(
+                f"latent spatial shape must be {(self.latent_height, self.latent_width)}, "
+                f"got {tuple(latent.shape[-2:])}"
+            )
+        return self.latent_stem(latent.to(dtype=torch.float32))
+
+    def encode_condition_base(
+        self,
+        *,
+        class_labels: torch.Tensor | None,
+        condition: torch.Tensor | None,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if self.condition_layer is None:
+            return None
+        resolved_condition = class_labels if condition is None else condition
+        if resolved_condition is None:
+            raise ValueError("condition must be provided when conditioning is enabled")
+        return self.condition_layer(resolved_condition.to(device=device))
+
+    def _build_conditioning_repr_from_base(
         self,
         *,
         batch_size: int,
         device: torch.device,
         timesteps: torch.Tensor | int,
-        class_labels: torch.Tensor | None,
-        condition: torch.Tensor | None,
+        condition_base: torch.Tensor | None,
     ) -> torch.Tensor:
         if isinstance(timesteps, int):
             timestep_tensor = torch.full((batch_size,), int(timesteps), device=device, dtype=torch.long)
@@ -215,12 +240,41 @@ class IterativeMultiscaleEncoder(nn.Module):
         if self.condition_layer is None:
             fused_input = timestep_repr
         else:
-            resolved_condition = class_labels if condition is None else condition
-            if resolved_condition is None:
-                raise ValueError("condition must be provided when conditioning is enabled")
-            condition_repr = self.condition_layer(resolved_condition.to(device=device))
-            fused_input = torch.cat([condition_repr, timestep_repr], dim=1)
+            if condition_base is None:
+                raise ValueError("condition_base must be provided when conditioning is enabled")
+            fused_input = torch.cat([condition_base, timestep_repr], dim=1)
         return self.conditioning_projector(fused_input.to(dtype=torch.float32))
+
+    def forward_from_encoded(
+        self,
+        *,
+        prev_image: torch.Tensor,
+        latent_base: torch.Tensor,
+        timesteps: torch.Tensor | int,
+        condition_base: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if latent_base.dim() != 4 or int(latent_base.shape[1]) != self.latent_stage_channels[0]:
+            raise ValueError(
+                "latent_base must be the encoded latent stem output, "
+                f"got {tuple(latent_base.shape)}"
+            )
+        batch_size = int(latent_base.shape[0])
+        prev_features = self._encode_prev_image(prev_image)
+        conditioning_repr = self._build_conditioning_repr_from_base(
+            batch_size=batch_size,
+            device=latent_base.device,
+            timesteps=timesteps,
+            condition_base=condition_base,
+        )
+
+        hidden = latent_base
+        for index, (target_size, block) in enumerate(zip(self.stage_sizes, self.blocks)):
+            hidden = _interpolate_like(hidden, size=target_size, mode=self.upsample_mode)
+            hidden = self.stage_projectors[index](hidden)
+            prev_feature = _interpolate_like(prev_features[index], size=target_size, mode=self.upsample_mode)
+            hidden = hidden + self.prev_projectors[index](prev_feature)
+            hidden = block(hidden, conditioning_repr)
+        return self.head(hidden)
 
     def forward(
         self,
@@ -231,33 +285,18 @@ class IterativeMultiscaleEncoder(nn.Module):
         class_labels: torch.Tensor | None = None,
         condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if latent.dim() != 4 or int(latent.shape[1]) != self.latent_channels:
-            raise ValueError(
-                f"latent must be [B,{self.latent_channels},H,W], got {tuple(latent.shape)}"
-            )
-        if tuple(latent.shape[-2:]) != (self.latent_height, self.latent_width):
-            raise ValueError(
-                f"latent spatial shape must be {(self.latent_height, self.latent_width)}, "
-                f"got {tuple(latent.shape[-2:])}"
-            )
-        batch_size = int(latent.shape[0])
-        prev_features = self._encode_prev_image(prev_image)
-        conditioning_repr = self._build_conditioning_repr(
-            batch_size=batch_size,
-            device=latent.device,
-            timesteps=timesteps,
+        latent_base = self.encode_latent(latent)
+        condition_base = self.encode_condition_base(
             class_labels=class_labels,
             condition=condition,
+            device=latent.device,
         )
-
-        hidden = self.latent_stem(latent.to(dtype=torch.float32))
-        for index, (target_size, block) in enumerate(zip(self.stage_sizes, self.blocks)):
-            hidden = _interpolate_like(hidden, size=target_size, mode=self.upsample_mode)
-            hidden = self.stage_projectors[index](hidden)
-            prev_feature = _interpolate_like(prev_features[index], size=target_size, mode=self.upsample_mode)
-            hidden = hidden + self.prev_projectors[index](prev_feature)
-            hidden = block(hidden, conditioning_repr)
-        return self.head(hidden)
+        return self.forward_from_encoded(
+            prev_image=prev_image,
+            latent_base=latent_base,
+            timesteps=timesteps,
+            condition_base=condition_base,
+        )
 
 
 class IterativeOpticalDecoder(nn.Module):
@@ -330,12 +369,17 @@ class IterativeMultiscaleOpticalModel(nn.Module):
         error_factor: float | None = None,
     ) -> dict[str, torch.Tensor]:
         prev_image = self._to_image(prev_image)
-        control_map = self.encoder(
-            prev_image=prev_image,
-            latent=latent,
-            timesteps=step_id,
+        latent_base = self.encoder.encode_latent(latent)
+        condition_base = self.encoder.encode_condition_base(
             class_labels=class_labels,
             condition=condition,
+            device=latent.device,
+        )
+        control_map = self.encoder.forward_from_encoded(
+            prev_image=prev_image,
+            latent_base=latent_base,
+            timesteps=step_id,
+            condition_base=condition_base,
         )
         prediction = self.decoder(control_map, error_factor=error_factor)["final_detector"]
         return {
@@ -363,24 +407,28 @@ class IterativeMultiscaleOpticalModel(nn.Module):
             )
         else:
             prev_state = self._to_image(initial_state).to(device=latent.device, dtype=torch.float32)
+        latent_base = self.encoder.encode_latent(latent)
+        condition_base = self.encoder.encode_condition_base(
+            class_labels=class_labels,
+            condition=condition,
+            device=latent.device,
+        )
 
         predictions: list[torch.Tensor] = []
         states: list[torch.Tensor] = []
         control_maps: list[torch.Tensor] = []
         for step_index in range(int(num_steps)):
-            step_output = self.forward_step(
+            control_map = self.encoder.forward_from_encoded(
                 prev_image=prev_state,
-                latent=latent,
-                step_id=step_index,
-                class_labels=class_labels,
-                condition=condition,
-                error_factor=error_factor,
+                latent_base=latent_base,
+                timesteps=step_index,
+                condition_base=condition_base,
             )
-            prediction = step_output["final_detector"]
+            prediction = self.decoder(control_map, error_factor=error_factor)["final_detector"]
             normalized_state = self.normalize_state(prediction)
             predictions.append(prediction)
             states.append(normalized_state)
-            control_maps.append(step_output["control_map"])
+            control_maps.append(control_map)
             prev_state = normalized_state.detach() if detach_prev_state else normalized_state
         return {
             "predictions": tuple(predictions),

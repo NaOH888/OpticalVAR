@@ -69,6 +69,22 @@ class FrequencyPathTests(unittest.TestCase):
         self.assertEqual(len(output["target_scales"]), 3)
         self.assertEqual(len(output["target_bands"]), 3)
 
+    def test_transform_supports_power_equalized_cutoffs(self) -> None:
+        transform = MultiScaleFrequencyTargetTransform(
+            num_levels=3,
+            transition_width=0.05,
+            cutoff_mode="power_equalized",
+        )
+        image = torch.zeros((1, 8, 8), dtype=torch.float32)
+        image[:, 2:6, 2:6] = 1.0
+
+        output = transform(image)
+
+        self.assertEqual(transform.cutoff_mode, "power_equalized")
+        self.assertEqual(len(output["target_scales"]), 3)
+        self.assertEqual(len(output["target_bands"]), 3)
+        self.assertTrue(torch.allclose(output["target_scale_3"], image))
+
     def test_dataset_wraps_tuple_dataset_and_attaches_targets(self) -> None:
         dataset = FrequencyPathDataset(
             _TupleImageDataset(),

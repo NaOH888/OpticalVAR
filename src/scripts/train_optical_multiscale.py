@@ -97,6 +97,7 @@ def _build_dataset_and_loader(
         num_levels=int(multiscale_cfg["num_levels"]),
         max_freq_fraction=float(multiscale_cfg.get("max_freq_fraction", 1.0)),
         transition_width=float(multiscale_cfg.get("transition_width", 0.05)),
+        cutoff_mode=str(multiscale_cfg.get("cutoff_mode", "linear")),
         cutoffs=_resolve_multiscale_cutoffs(
             multiscale_cfg,
             config_dir=config_dir,

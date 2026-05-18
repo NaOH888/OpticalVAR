@@ -45,18 +45,30 @@ class IterativeStepLoss(nn.Module):
         loss_type: str = "l1",
         perceptual_weight: float = 0.0,
         perceptual_loss_fn: nn.Module | None = None,
+        state_normalization: str = "mean_power",
     ) -> None:
         super().__init__()
         self.num_steps = int(num_steps)
         self.loss_type = str(loss_type)
         self.perceptual_weight = float(perceptual_weight)
         self.perceptual_loss_fn = perceptual_loss_fn
+        self.state_normalization = str(state_normalization)
         if self.num_steps <= 0:
             raise ValueError("num_steps must be positive")
         if self.loss_type not in {"l1", "mse"}:
             raise ValueError(f"loss_type must be 'l1' or 'mse', got {self.loss_type!r}")
         if self.perceptual_weight != 0.0 and self.perceptual_loss_fn is None:
             raise ValueError("perceptual_loss_fn must be provided when perceptual_weight is non-zero")
+        if self.state_normalization != "mean_power":
+            raise ValueError(
+                "state_normalization must be 'mean_power' for the first implementation, "
+                f"got {self.state_normalization!r}"
+            )
+
+    @staticmethod
+    def _normalize_image(image: torch.Tensor) -> torch.Tensor:
+        mean_power = image.mean(dim=(-2, -1), keepdim=True).clamp_min(1.0e-8)
+        return image / mean_power
 
     def _base_loss(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if prediction.shape != target.shape:
@@ -83,9 +95,11 @@ class IterativeStepLoss(nn.Module):
             target = batch[target_key]
             if target.dim() == 3:
                 target = target.unsqueeze(1)
-            base_loss = self._base_loss(prediction, target)
+            normalized_prediction = self._normalize_image(prediction)
+            normalized_target = self._normalize_image(target.to(dtype=torch.float32))
+            base_loss = self._base_loss(normalized_prediction, normalized_target)
             perceptual_loss = (
-                self.perceptual_loss_fn(prediction, target)
+                self.perceptual_loss_fn(normalized_prediction, normalized_target)
                 if self.perceptual_weight != 0.0 and self.perceptual_loss_fn is not None
                 else base_loss.new_zeros(())
             )
@@ -95,14 +109,15 @@ class IterativeStepLoss(nn.Module):
             total = loss if total is None else total + loss
         if total is None:
             raise RuntimeError("step loss list must not be empty")
-        step_loss_mean = total / float(self.num_steps)
-        final_step_loss = step_losses[-1]
-        mean_perceptual = torch.stack(step_perceptual_losses).mean() if step_perceptual_losses else final_step_loss.new_zeros(())
+        scale_loss = total / float(self.num_steps)
+        final_loss = step_losses[-1]
+        mean_perceptual = torch.stack(step_perceptual_losses).mean() if step_perceptual_losses else final_loss.new_zeros(())
         return {
-            "total_loss": step_loss_mean,
-            "final_step_loss": final_step_loss,
+            "total_loss": scale_loss,
+            "final_loss": final_loss,
+            "scale_loss": scale_loss,
             "perceptual_loss": mean_perceptual,
-            "step_losses": tuple(step_losses),
+            "scale_losses": tuple(step_losses),
         }
 
 
@@ -124,6 +139,7 @@ def _build_dataset_and_loader(
         num_levels=int(multiscale_cfg["num_levels"]),
         max_freq_fraction=float(multiscale_cfg.get("max_freq_fraction", 1.0)),
         transition_width=float(multiscale_cfg.get("transition_width", 0.05)),
+        cutoff_mode=str(multiscale_cfg.get("cutoff_mode", "linear")),
         cutoffs=_resolve_multiscale_cutoffs(multiscale_cfg, config_dir=config_dir, repo_root=repo_root),
     )
     dataset = FrequencyPathDataset(
@@ -315,6 +331,7 @@ def _build_condition_batch(batch: dict[str, Any], *, config: dict[str, Any], dev
 
 def _build_loss(config: dict[str, Any], *, device: torch.device, num_steps: int) -> IterativeStepLoss:
     loss_cfg = dict(config["loss"])
+    iterative_cfg = dict(config["iterative"])
     perceptual_loss_fn = build_perceptual_loss(
         {
             "perceptual_weight": float(loss_cfg.get("perceptual_weight", 0.0)),
@@ -329,6 +346,7 @@ def _build_loss(config: dict[str, Any], *, device: torch.device, num_steps: int)
         loss_type=str(loss_cfg.get("loss_type", "l1")),
         perceptual_weight=float(loss_cfg.get("perceptual_weight", 0.0)),
         perceptual_loss_fn=perceptual_loss_fn,
+        state_normalization=str(iterative_cfg.get("state_normalization", "mean_power")),
     )
 
 
@@ -376,6 +394,7 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
         max_epochs = int(train_cfg.get("epochs", 1))
         log_interval = int(train_cfg.get("log_interval", 10))
         max_steps_per_epoch = train_cfg.get("max_steps_per_epoch")
+        grad_clip_norm = train_cfg.get("grad_clip_norm")
         latest_metrics: dict[str, Any] = {}
 
         for epoch_idx in range(max_epochs):
@@ -402,12 +421,14 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
 
                 optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
+                if grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip_norm))
                 optimizer.step()
 
                 running_total += float(total_loss.detach().cpu())
-                running_final += float(loss_output["final_step_loss"].detach().cpu())
+                running_final += float(loss_output["final_loss"].detach().cpu())
                 running_perceptual += float(loss_output["perceptual_loss"].detach().cpu())
-                for index, step_loss in enumerate(loss_output["step_losses"]):
+                for index, step_loss in enumerate(loss_output["scale_losses"]):
                     step_running[index] += float(step_loss.detach().cpu())
                 step_count += 1
 
@@ -417,7 +438,8 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
                         f"[epoch {epoch_idx + 1}/{max_epochs}] step={batch_idx} "
                         f"total={running_total / step_count:.6f} "
                         f"final={running_final / step_count:.6f} "
-                        f"steps={step_means}"
+                        f"scale={running_total / step_count:.6f} "
+                        f"scale_losses={step_means}"
                     )
 
                 if max_steps_per_epoch is not None and batch_idx >= int(max_steps_per_epoch):
@@ -429,13 +451,16 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
             latest_metrics = {
                 "epoch": epoch_idx + 1,
                 "total_loss": running_total / step_count,
-                "final_step_loss": running_final / step_count,
+                "final_loss": running_final / step_count,
+                "scale_loss": running_total / step_count,
                 "perceptual_loss": running_perceptual / step_count,
-                "step_losses": [value / step_count for value in step_running],
+                "scale_losses": [value / step_count for value in step_running],
             }
             print(
                 f"[epoch {epoch_idx + 1}/{max_epochs}] total={latest_metrics['total_loss']:.6f} "
-                f"final={latest_metrics['final_step_loss']:.6f} step_losses={latest_metrics['step_losses']}"
+                f"final={latest_metrics['final_loss']:.6f} "
+                f"scale={latest_metrics['scale_loss']:.6f} "
+                f"scale_losses={latest_metrics['scale_losses']}"
             )
             _append_jsonl(history_path, latest_metrics)
             torch.save(

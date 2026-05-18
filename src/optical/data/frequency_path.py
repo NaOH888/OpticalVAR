@@ -27,6 +27,7 @@ class MultiScaleFrequencyTargetTransform:
         num_levels: int,
         max_freq_fraction: float = 1.0,
         transition_width: float = 0.05,
+        cutoff_mode: str = "linear",
         cutoffs: Sequence[float] | None = None,
     ) -> None:
         if int(num_levels) <= 0:
@@ -41,6 +42,12 @@ class MultiScaleFrequencyTargetTransform:
         self.num_levels = int(num_levels)
         self.max_freq_fraction = float(max_freq_fraction)
         self.transition_width = float(transition_width)
+        self.cutoff_mode = str(cutoff_mode)
+        if self.cutoff_mode not in {"linear", "power_equalized"}:
+            raise ValueError(
+                "cutoff_mode must be one of {'linear', 'power_equalized'}, "
+                f"got {self.cutoff_mode!r}"
+            )
         self.cutoffs = self._resolve_cutoffs(cutoffs)
 
     def _resolve_cutoffs(self, cutoffs: Sequence[float] | None) -> tuple[float, ...] | None:
@@ -82,6 +89,62 @@ class MultiScaleFrequencyTargetTransform:
         radius_max = torch.clamp_min(radius.max(), 1.0e-12)
         return radius / radius_max
 
+    def _build_power_equalized_cutoffs(
+        self,
+        *,
+        radius: torch.Tensor,
+        image_spectrum: torch.Tensor,
+    ) -> torch.Tensor:
+        energy = image_spectrum.abs().square().sum(dim=0)
+        radius_flat = radius.reshape(-1)
+        energy_flat = energy.reshape(-1)
+        valid_mask = radius_flat <= self.max_freq_fraction
+        valid_radius = radius_flat[valid_mask]
+        valid_energy = energy_flat[valid_mask]
+        if valid_radius.numel() == 0:
+            return torch.full(
+                (self.num_levels - 1,),
+                fill_value=self.max_freq_fraction,
+                device=radius.device,
+                dtype=radius.dtype,
+            )
+        order = torch.argsort(valid_radius)
+        radius_sorted = valid_radius[order]
+        energy_sorted = valid_energy[order]
+        cumulative_energy = torch.cumsum(energy_sorted, dim=0)
+        total_energy = cumulative_energy[-1].clamp_min(1.0e-12)
+        targets = torch.linspace(
+            1.0 / float(self.num_levels),
+            float(self.num_levels - 1) / float(self.num_levels),
+            steps=self.num_levels - 1,
+            device=radius.device,
+            dtype=radius.dtype,
+        ) * total_energy
+        cutoffs: list[torch.Tensor] = []
+        for target in targets:
+            index = torch.searchsorted(cumulative_energy, target, right=False)
+            index = torch.clamp(index, max=radius_sorted.numel() - 1)
+            cutoffs.append(radius_sorted[index])
+        return torch.stack(cutoffs, dim=0)
+
+    def _resolve_runtime_cutoffs(
+        self,
+        *,
+        radius: torch.Tensor,
+        image_spectrum: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.cutoffs is not None:
+            return torch.tensor(self.cutoffs, device=radius.device, dtype=radius.dtype)
+        if self.cutoff_mode == "linear":
+            return torch.linspace(
+                self.max_freq_fraction / float(self.num_levels),
+                self.max_freq_fraction * float(self.num_levels - 1) / float(self.num_levels),
+                steps=self.num_levels - 1,
+                device=radius.device,
+                dtype=radius.dtype,
+            )
+        return self._build_power_equalized_cutoffs(radius=radius, image_spectrum=image_spectrum)
+
     def _build_cumulative_scales(self, image: torch.Tensor) -> list[torch.Tensor]:
         if self.num_levels == 1:
             return [image]
@@ -92,16 +155,7 @@ class MultiScaleFrequencyTargetTransform:
         image_spectrum = torch.fft.fftshift(torch.fft.fft2(image, dim=(-2, -1), norm="ortho"), dim=(-2, -1))
 
         cumulative_scales: list[torch.Tensor] = []
-        if self.cutoffs is None:
-            cutoffs = torch.linspace(
-                self.max_freq_fraction / float(self.num_levels),
-                self.max_freq_fraction * float(self.num_levels - 1) / float(self.num_levels),
-                steps=self.num_levels - 1,
-                device=image.device,
-                dtype=image.dtype,
-            )
-        else:
-            cutoffs = torch.tensor(self.cutoffs, device=image.device, dtype=image.dtype)
+        cutoffs = self._resolve_runtime_cutoffs(radius=radius, image_spectrum=image_spectrum)
         for cutoff in cutoffs:
             mask = torch.sigmoid((cutoff - radius) / self.transition_width)
             filtered = torch.fft.ifft2(

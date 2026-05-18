@@ -82,6 +82,7 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
                     },
                     "multiscale": {
                         "num_levels": 3,
+                        "cutoff_mode": "power_equalized",
                         "max_freq_fraction": 1.0,
                         "transition_width": 0.05,
                     },
@@ -164,6 +165,7 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
                     "training": {
                         "epochs": 1,
                         "lr": 1.0e-3,
+                        "grad_clip_norm": 1.0,
                         "weight_decay": 0.0,
                         "log_interval": 1,
                         "max_steps_per_epoch": 1,
@@ -188,8 +190,9 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             history_lines = (outputs_dir / "history.jsonl").read_text(encoding="utf-8").strip().splitlines()
             payload = json.loads(history_lines[-1])
             self.assertIn("total_loss", payload)
-            self.assertIn("final_step_loss", payload)
-            self.assertEqual(len(payload["step_losses"]), 3)
+            self.assertIn("final_loss", payload)
+            self.assertIn("scale_loss", payload)
+            self.assertEqual(len(payload["scale_losses"]), 3)
 
     def test_train_requires_num_steps_match_num_levels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
