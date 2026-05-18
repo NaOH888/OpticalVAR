@@ -193,6 +193,8 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             self.assertIn("total_loss", payload)
             self.assertIn("final_loss", payload)
             self.assertIn("scale_loss", payload)
+            self.assertIn("scale_losses", payload)
+            self.assertEqual(len(payload["scale_losses"]), 3)
             self.assertIn("band_loss", payload)
             self.assertIn("tv_loss", payload)
             self.assertIn("background_loss", payload)
@@ -295,6 +297,47 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             + 1.0 * float(scale_losses[2].detach().cpu())
         ) / 7.0
         self.assertAlmostEqual(float(output["scale_loss"].detach().cpu()), expected_weighted, places=6)
+
+    def test_iterative_step_loss_keeps_perceptual_out_of_scale_and_final(self) -> None:
+        class ConstantPerceptual(torch.nn.Module):
+            def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+                return prediction.new_tensor(2.0)
+
+        criterion = IterativeStepLoss(
+            num_steps=2,
+            loss_type="l1",
+            step_weights=[1.0, 1.0],
+            perceptual_weight=0.5,
+            perceptual_loss_fn=ConstantPerceptual(),
+            state_normalization="mean_power",
+        )
+        predictions = (
+            torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]], dtype=torch.float32),
+            torch.tensor([[[[1.0, 1.0], [0.0, 0.0]]]], dtype=torch.float32),
+        )
+        batch = {
+            "target_scale_1": torch.tensor([[[[1.0, 1.0], [0.0, 0.0]]]], dtype=torch.float32),
+            "target_scale_2": torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]]], dtype=torch.float32),
+        }
+
+        output = criterion(predictions=predictions, batch=batch)
+
+        step_losses = output["scale_losses"]
+        expected_scale = 0.5 * (
+            float(step_losses[0].detach().cpu()) + float(step_losses[1].detach().cpu())
+        )
+        self.assertAlmostEqual(float(output["scale_loss"].detach().cpu()), expected_scale, places=6)
+        self.assertAlmostEqual(
+            float(output["final_loss"].detach().cpu()),
+            float(step_losses[-1].detach().cpu()),
+            places=6,
+        )
+        self.assertAlmostEqual(float(output["perceptual_loss"].detach().cpu()), 2.0, places=6)
+        self.assertAlmostEqual(
+            float(output["total_loss"].detach().cpu()),
+            expected_scale + 1.0,
+            places=6,
+        )
 
 
 if __name__ == "__main__":

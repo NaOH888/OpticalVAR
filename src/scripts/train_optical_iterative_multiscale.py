@@ -176,8 +176,7 @@ class IterativeStepLoss(nn.Module):
                 if apply_perceptual and self.perceptual_weight != 0.0 and self.perceptual_loss_fn is not None
                 else base_loss.new_zeros(())
             )
-            loss = base_loss + self.perceptual_weight * perceptual_loss
-            step_losses.append(loss)
+            step_losses.append(base_loss)
             step_perceptual_losses.append(perceptual_loss)
         if not step_losses:
             raise RuntimeError("step loss list must not be empty")
@@ -197,7 +196,11 @@ class IterativeStepLoss(nn.Module):
         final_loss = step_losses[-1]
         final_perceptual = step_perceptual_losses[-1] if step_perceptual_losses else final_loss.new_zeros(())
         return {
-            "total_loss": scale_loss + self.latent_diversity_weight * latent_diversity_loss,
+            "total_loss": (
+                scale_loss
+                + self.perceptual_weight * final_perceptual
+                + self.latent_diversity_weight * latent_diversity_loss
+            ),
             "final_loss": final_loss,
             "scale_loss": scale_loss,
             "band_loss": scale_loss.new_zeros(()),
@@ -504,6 +507,7 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
             running_background = 0.0
             running_latent_div = 0.0
             running_perceptual = 0.0
+            running_scale_steps = [0.0 for _ in range(num_steps)]
             step_count = 0
 
             for batch_idx, batch in enumerate(loader, start=1):
@@ -535,9 +539,13 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
                 running_perceptual += float(loss_output["perceptual_loss"].detach().cpu())
                 latent_div_value = float(loss_output["latent_diversity_loss"].detach().cpu())
                 running_latent_div += latent_div_value
+                step_losses = loss_output["scale_losses"]
+                for step_index, step_loss in enumerate(step_losses):
+                    running_scale_steps[step_index] += float(step_loss.detach().cpu())
                 step_count += 1
 
                 if batch_idx % log_interval == 0:
+                    avg_scale_steps = [value / step_count for value in running_scale_steps]
                     print(
                         f"[epoch {epoch_idx + 1}/{max_epochs}] step={batch_idx} "
                         f"total={running_total / step_count:.6f} "
@@ -548,6 +556,7 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
                         f"bg={running_background / step_count:.6f} "
                         f"perc={running_perceptual / step_count:.6f} "
                         f"latent_div={running_latent_div / step_count:.6f} "
+                        f"scale_losses={avg_scale_steps} "
                     )
 
                 if max_steps_per_epoch is not None and batch_idx >= int(max_steps_per_epoch):
@@ -561,6 +570,7 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
                 "total_loss": running_total / step_count,
                 "final_loss": running_final / step_count,
                 "scale_loss": running_scale / step_count,
+                "scale_losses": [value / step_count for value in running_scale_steps],
                 "band_loss": running_band / step_count,
                 "tv_loss": running_tv / step_count,
                 "background_loss": running_background / step_count,
@@ -572,6 +582,7 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
                 f"[epoch {epoch_idx + 1}/{max_epochs}] total={latest_metrics['total_loss']:.6f} "
                 f"final={latest_metrics['final_loss']:.6f} "
                 f"scale={latest_metrics['scale_loss']:.6f} "
+                f"scale_losses={latest_metrics['scale_losses']} "
                 f"band={latest_metrics['band_loss']:.6f} "
                 f"tv={latest_metrics['tv_loss']:.6f} "
                 f"bg={latest_metrics['background_loss']:.6f} "
