@@ -180,8 +180,9 @@ def _build_condition_layer(config: dict[str, Any]) -> tuple[ConditionEmbeddingLa
 
 def _build_optical_decoder(config: dict[str, Any]) -> OpticalPrefixReadoutDecoder:
     optical_cfg = dict(config["optical"])
-    multiscale_cfg = dict(config["multiscale"])
-    num_levels = int(multiscale_cfg["num_levels"])
+    optical_num_layers = int(optical_cfg.get("num_layers", config["multiscale"]["num_levels"]))
+    if optical_num_layers <= 0:
+        raise ValueError("optical.num_layers must be positive")
     source_cfg = SourceConfig(
         wavelengths_m=tuple(float(value) for value in optical_cfg["source"]["wavelengths_m"]),
         light_mode=str(optical_cfg["source"]["light_mode"]),
@@ -201,10 +202,10 @@ def _build_optical_decoder(config: dict[str, Any]) -> OpticalPrefixReadoutDecode
     )
     phase_cfg = dict(optical_cfg["phase_layer"])
     modulation_mode = _resolve_surface_modulation_mode(phase_cfg)
-    frozen_layers = _resolve_frozen_phase_layers(phase_cfg=phase_cfg, num_levels=num_levels)
+    frozen_layers = _resolve_frozen_phase_layers(phase_cfg=phase_cfg, num_levels=optical_num_layers)
 
     optical_layers: list[nn.Module] = []
-    for layer_index in range(num_levels):
+    for layer_index in range(optical_num_layers):
         width_m, height_m, grid_h, grid_w = _resolve_phase_layer_geometry(phase_cfg=phase_cfg, slm=slm)
         if modulation_mode == "phase":
             layer = DiffractivePhaseLayer(
@@ -272,7 +273,7 @@ def _build_optical_decoder(config: dict[str, Any]) -> OpticalPrefixReadoutDecode
         distance_slm_to_first_layer_m=float(optical_cfg["distances_m"]["slm_to_first_layer_m"]),
         distance_between_layers_m=_expand_between_layer_distances(
             optical_cfg["distances_m"]["between_layers_m"],
-            num_levels=num_levels,
+            num_levels=optical_num_layers,
         ),
         distance_last_layer_to_detector_m=float(optical_cfg["distances_m"]["last_layer_to_detector_m"]),
         propagation_config=propagation_cfg,

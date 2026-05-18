@@ -204,6 +204,19 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 train(config, config_path=config_path)
 
+    def test_train_allows_optical_num_layers_different_from_num_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path, outputs_dir = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["optical"]["num_layers"] = 2
+            config["optical"]["distances_m"]["between_layers_m"] = [2.0e-6]
+
+            result = train(config, config_path=config_path)
+
+            self.assertTrue((outputs_dir / "latest.pt").exists())
+            self.assertIn("metrics", result)
+
 
 if __name__ == "__main__":
     unittest.main()
