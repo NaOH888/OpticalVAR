@@ -1,4 +1,9 @@
 from conditioning import ConditionEmbeddingLayer
+from optical.models.iterative_multiscale import (
+    IterativeMultiscaleEncoder,
+    IterativeMultiscaleOpticalModel,
+    IterativeOpticalDecoder,
+)
 from optical.models.multiscale import (
     OpticalMultiscaleModel,
     OpticalPrefixReadoutDecoder,
@@ -7,6 +12,9 @@ from optical.models.multiscale import (
 
 __all__ = [
     "ConditionEmbeddingLayer",
+    "IterativeMultiscaleEncoder",
+    "IterativeOpticalDecoder",
+    "IterativeMultiscaleOpticalModel",
     "SpatialPhaseMapEncoder",
     "OpticalMultiscaleModel",
     "OpticalPrefixReadoutDecoder",
