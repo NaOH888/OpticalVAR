@@ -19,7 +19,7 @@ if __package__ in {None, ""}:
 from conditioning import ConditionEmbeddingLayer
 from optical.core import DetectorConfig, PropagationConfig, PropagationErrorConfig, SourceConfig
 from optical.data import FrequencyPathDataset, MultiScaleFrequencyTargetTransform, NpzImageDataset
-from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
+from optical.layers import DetectorLayer, DiffractiveAmplitudeLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.losses import OpticalMultiscaleLoss
 from optical.models import OpticalMultiscaleModel, OpticalPrefixReadoutDecoder, SpatialPhaseMapEncoder
 from vae import build_perceptual_loss
@@ -160,6 +160,37 @@ def _build_initial_phase_map(
     raise ValueError(f"Unsupported phase init_mode: {init_mode!r}")
 
 
+def _build_initial_amplitude_map(
+    *,
+    phase_cfg: dict[str, Any],
+    source_cfg: SourceConfig,
+    amplitude_grid_height: int,
+    amplitude_grid_width: int,
+) -> torch.Tensor:
+    init_mode = str(phase_cfg.get("init_mode", "constant"))
+    share_across_channels = bool(phase_cfg.get("share_across_channels", True))
+    channels = 1 if share_across_channels else len(source_cfg.wavelengths_m)
+    shape = (
+        (channels, amplitude_grid_height, amplitude_grid_width)
+        if channels > 1
+        else (amplitude_grid_height, amplitude_grid_width)
+    )
+
+    if init_mode == "constant":
+        initial_amplitude_value = float(phase_cfg.get("initial_amplitude_value", 1.0))
+        return torch.full(shape, fill_value=initial_amplitude_value, dtype=torch.float32)
+    if init_mode == "uniform":
+        init_min_amplitude = float(phase_cfg.get("init_min_amplitude", 0.0))
+        init_max_amplitude = float(phase_cfg.get("init_max_amplitude", 1.0))
+        if init_max_amplitude <= init_min_amplitude:
+            raise ValueError(
+                "amplitude init range must satisfy init_max_amplitude > init_min_amplitude, "
+                f"got {(init_min_amplitude, init_max_amplitude)}"
+            )
+        return torch.empty(shape, dtype=torch.float32).uniform_(init_min_amplitude, init_max_amplitude)
+    raise ValueError(f"Unsupported amplitude init_mode: {init_mode!r}")
+
+
 def _resolve_phase_layer_geometry(
     *,
     phase_cfg: dict[str, Any],
@@ -204,6 +235,16 @@ def _resolve_frozen_phase_layers(
     return values
 
 
+def _resolve_surface_modulation_mode(phase_cfg: dict[str, Any]) -> str:
+    mode = str(phase_cfg.get("modulation_mode", "phase")).lower()
+    if mode not in {"phase", "amplitude"}:
+        raise ValueError(
+            "phase_layer.modulation_mode must be one of {'phase', 'amplitude'}, "
+            f"got {mode!r}"
+        )
+    return mode
+
+
 def _build_model(
     config: dict[str, Any],
     *,
@@ -234,13 +275,15 @@ def _build_model(
 
     phase_cfg = dict(optical_cfg["phase_layer"])
     frozen_phase_layers = _resolve_frozen_phase_layers(phase_cfg=phase_cfg, num_levels=num_levels)
+    modulation_mode = _resolve_surface_modulation_mode(phase_cfg)
     optical_layers = []
     for layer_index in range(num_levels):
         width_m, height_m, phase_grid_height, phase_grid_width = _resolve_phase_layer_geometry(
             phase_cfg=phase_cfg,
             slm=slm,
         )
-        layer = DiffractivePhaseLayer(
+        if modulation_mode == "phase":
+            layer = DiffractivePhaseLayer(
                 width_m=width_m,
                 height_m=height_m,
                 dx_m=slm.dx,
@@ -256,6 +299,22 @@ def _build_model(
                     source_cfg=source_cfg,
                     phase_grid_height=phase_grid_height,
                     phase_grid_width=phase_grid_width,
+                ),
+            )
+        else:
+            layer = DiffractiveAmplitudeLayer(
+                width_m=width_m,
+                height_m=height_m,
+                dx_m=slm.dx,
+                channels=len(source_cfg.wavelengths_m),
+                share_across_channels=bool(phase_cfg.get("share_across_channels", True)),
+                amplitude_grid_height=phase_grid_height,
+                amplitude_grid_width=phase_grid_width,
+                initial_amplitude_map=_build_initial_amplitude_map(
+                    phase_cfg=phase_cfg,
+                    source_cfg=source_cfg,
+                    amplitude_grid_height=phase_grid_height,
+                    amplitude_grid_width=phase_grid_width,
                 ),
             )
         if frozen_phase_layers[layer_index]:

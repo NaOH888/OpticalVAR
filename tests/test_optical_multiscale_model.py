@@ -14,7 +14,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from conditioning import ConditionEmbeddingLayer
 from optical.core import DetectorConfig, PropagationConfig, PropagationErrorConfig, SourceConfig
-from optical.layers import DetectorLayer, DiffractivePhaseLayer, SLMDeviceLayer
+from optical.layers import DetectorLayer, DiffractiveAmplitudeLayer, DiffractivePhaseLayer, SLMDeviceLayer
 from optical.models import (
     OpticalMultiscaleModel,
     OpticalPrefixReadoutDecoder,
@@ -235,6 +235,67 @@ class OpticalMultiscaleModelTests(unittest.TestCase):
         self.assertIn("prefix_readout_2", outputs)
         self.assertIn("final_detector", outputs)
         self.assertTrue(torch.allclose(outputs["prefix_readout_2"], outputs["final_detector"], atol=1e-5))
+
+    def test_prefix_readout_decoder_supports_amplitude_metasurfaces(self) -> None:
+        source_config = SourceConfig(
+            wavelengths_m=(532e-9,),
+            light_mode="amplitude",
+            amplitude=1.0,
+        )
+        slm = SLMDeviceLayer(
+            pixel_pitch_x_m=1e-6,
+            pixel_pitch_y_m=1e-6,
+            pixel_count_x=4,
+            pixel_count_y=4,
+            dx=1e-6,
+            fill_factor=1.0,
+            phase_alpha=2.0,
+            phase_bit_depth=None,
+            source_config=source_config,
+        )
+        amp_1 = DiffractiveAmplitudeLayer(
+            width_m=4e-6,
+            height_m=4e-6,
+            dx_m=1e-6,
+            channels=1,
+            initial_amplitude_map=torch.full((4, 4), 0.75, dtype=torch.float32),
+        )
+        amp_2 = DiffractiveAmplitudeLayer(
+            width_m=4e-6,
+            height_m=4e-6,
+            dx_m=1e-6,
+            channels=1,
+            initial_amplitude_map=torch.full((4, 4), 0.50, dtype=torch.float32),
+        )
+        detector = DetectorLayer(
+            config=DetectorConfig(
+                width_num=2,
+                height_num=2,
+                detector_unit_len_m=2e-6,
+            ),
+            dx_m=1e-6,
+        )
+        decoder = OpticalPrefixReadoutDecoder(
+            slm_layer=slm,
+            optical_layers=(amp_1, amp_2),
+            detector_layer=detector,
+            distance_slm_to_first_layer_m=2e-6,
+            distance_between_layers_m=(2e-6,),
+            distance_last_layer_to_detector_m=2e-6,
+            propagation_config=_default_propagation_config(),
+            error_config=PropagationErrorConfig(
+                delta_z_m=0.0,
+                shift_x_m=0.0,
+                shift_y_m=0.0,
+            ),
+            default_error_factor=1.0,
+        )
+
+        outputs = decoder(torch.ones((1, 1, 4, 4), dtype=torch.float32), error_factor=1.0)
+
+        self.assertEqual(tuple(outputs["prefix_readout_1"].shape), (1, 1, 2, 2))
+        self.assertEqual(tuple(outputs["prefix_readout_2"].shape), (1, 1, 2, 2))
+        self.assertTrue(torch.isfinite(outputs["final_detector"]).all().item())
 
 
 if __name__ == "__main__":

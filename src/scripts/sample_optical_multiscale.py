@@ -193,6 +193,7 @@ def _save_output_panels(
     prefix_readouts: tuple[torch.Tensor, ...],
     final_prediction: torch.Tensor,
     label: int | list[float] | None,
+    source_light_mode: str,
     target: torch.Tensor | None = None,
     target_bands: tuple[torch.Tensor, ...] | None = None,
 ) -> None:
@@ -212,14 +213,14 @@ def _save_output_panels(
     _save_panel(
         output_dir / f"{prefix_base}_encoder_phase.png",
         encoder_phase,
-        cmap="twilight",
-        title="encoder_phase",
+        cmap="twilight" if source_light_mode == "phase" else "gray",
+        title="encoder_phase" if source_light_mode == "phase" else "encoder_amplitude",
     )
     _save_panel(
         output_dir / f"{prefix_base}_slm.png",
         slm_phase,
-        cmap="twilight",
-        title="slm_phase",
+        cmap="twilight" if source_light_mode == "phase" else "gray",
+        title="slm_phase" if source_light_mode == "phase" else "slm_amplitude",
     )
     for index, readout in enumerate(prefix_readouts, start=1):
         _save_panel(
@@ -254,8 +255,8 @@ def _save_output_panels(
     panels.extend(
         [
             ("noise", latent_noise),
-            ("encoder_phase", encoder_phase),
-            ("slm_phase", slm_phase),
+            ("encoder_phase" if source_light_mode == "phase" else "encoder_amplitude", encoder_phase),
+            ("slm_phase" if source_light_mode == "phase" else "slm_amplitude", slm_phase),
             ("prediction", final_prediction),
         ]
     )
@@ -338,6 +339,7 @@ def main(argv: list[str] | None = None) -> None:
 
     checkpoint = _load_checkpoint(args.checkpoint.resolve(), device)
     config = checkpoint["config"]
+    source_light_mode = str(config["optical"]["source"]["light_mode"]).lower()
     if args.data_manifest is not None:
         config["dataset"]["manifest_path"] = str(args.data_manifest.resolve())
 
@@ -397,6 +399,7 @@ def main(argv: list[str] | None = None) -> None:
             prefix_readouts=prefix_readouts,
             final_prediction=final_prediction,
             label=label_value,
+            source_light_mode=source_light_mode,
             target=target,
             target_bands=target_bands,
         )
@@ -445,6 +448,7 @@ def main(argv: list[str] | None = None) -> None:
                     prefix_readouts=prefix_readouts,
                     final_prediction=final_prediction,
                     label=int(args.label),
+                    source_light_mode=source_light_mode,
                     target=None,
                 )
             generated.append(

@@ -149,6 +149,7 @@ def main(argv: list[str] | None = None) -> None:
 
     checkpoint = _load_checkpoint(args.checkpoint.resolve(), device)
     config = checkpoint["config"]
+    source_light_mode = str(config["optical"]["source"]["light_mode"]).lower()
     if args.data_manifest is not None:
         config["dataset"]["manifest_path"] = str(args.data_manifest.resolve())
 
@@ -229,9 +230,9 @@ def main(argv: list[str] | None = None) -> None:
         )
         _save_panel(
             args.output_dir / "anchor_phase.png",
-            title="anchor_phase",
+            title="anchor_phase" if source_light_mode == "phase" else "anchor_amplitude",
             image=anchor_outputs["encoder_output"],
-            mode="phase",
+            mode="phase" if source_light_mode == "phase" else "intensity",
         )
         _save_panel(
             args.output_dir / "anchor_final_detector.png",
@@ -241,9 +242,13 @@ def main(argv: list[str] | None = None) -> None:
         )
         _save_grid(
             args.output_dir / "latent_vary_phase_grid.png",
-            title="fixed condition, varying latent: encoder phase",
+            title=(
+                "fixed condition, varying latent: encoder phase"
+                if source_light_mode == "phase"
+                else "fixed condition, varying latent: encoder amplitude"
+            ),
             images=latent_phase_images,
-            mode="phase",
+            mode="phase" if source_light_mode == "phase" else "intensity",
         )
         _save_grid(
             args.output_dir / "latent_vary_final_grid.png",
@@ -253,9 +258,13 @@ def main(argv: list[str] | None = None) -> None:
         )
         _save_grid(
             args.output_dir / "condition_vary_phase_grid.png",
-            title="fixed latent, varying condition: encoder phase",
+            title=(
+                "fixed latent, varying condition: encoder phase"
+                if source_light_mode == "phase"
+                else "fixed latent, varying condition: encoder amplitude"
+            ),
             images=condition_phase_images,
-            mode="phase",
+            mode="phase" if source_light_mode == "phase" else "intensity",
         )
         _save_grid(
             args.output_dir / "condition_vary_final_grid.png",

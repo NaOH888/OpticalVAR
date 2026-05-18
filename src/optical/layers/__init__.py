@@ -1,3 +1,4 @@
+from optical.layers.amplitude import DiffractiveAmplitudeLayer
 from optical.layers.detector import DetectorLayer
 from optical.layers.lens import ConvexLensLayer
 from optical.layers.metasurface import MetaEncoder
@@ -10,6 +11,7 @@ from optical.layers.source import LightSourceLayer
 
 __all__ = [
     "ConvexLensLayer",
+    "DiffractiveAmplitudeLayer",
     "DetectorLayer",
     "DiffractivePhaseLayer",
     "FieldProbeLayer",
