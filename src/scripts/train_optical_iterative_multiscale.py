@@ -92,6 +92,18 @@ class IterativeStepLoss(nn.Module):
             return torch.mean(torch.abs(prediction - target))
         return torch.mean((prediction - target).square())
 
+    def _scale_aligned_loss(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if prediction.shape != target.shape:
+            raise ValueError(f"prediction and target must match, got {tuple(prediction.shape)} vs {tuple(target.shape)}")
+        batch_size = int(prediction.shape[0])
+        prediction_flat = prediction.reshape(batch_size, -1)
+        target_flat = target.reshape(batch_size, -1)
+        numerator = torch.sum(prediction_flat * target_flat, dim=1, keepdim=True)
+        denominator = torch.sum(prediction_flat.square(), dim=1, keepdim=True).clamp_min(1.0e-8)
+        scale = numerator / denominator
+        aligned_prediction = (prediction_flat * scale).reshape_as(prediction)
+        return self._base_loss(aligned_prediction, target)
+
     def _latent_diversity_loss(
         self,
         *,
@@ -149,7 +161,6 @@ class IterativeStepLoss(nn.Module):
             raise ValueError(f"expected {self.num_steps} predictions, got {len(predictions)}")
         step_losses: list[torch.Tensor] = []
         step_perceptual_losses: list[torch.Tensor] = []
-        total = None
         for index, prediction in enumerate(predictions, start=1):
             target_key = f"target_scale_{index}"
             if target_key not in batch:
@@ -157,20 +168,18 @@ class IterativeStepLoss(nn.Module):
             target = batch[target_key]
             if target.dim() == 3:
                 target = target.unsqueeze(1)
-            normalized_prediction = self._normalize_image(prediction)
-            normalized_target = self._normalize_image(target.to(dtype=torch.float32))
-            base_loss = self._base_loss(normalized_prediction, normalized_target)
+            target = target.to(dtype=torch.float32)
+            base_loss = self._scale_aligned_loss(prediction, target)
             apply_perceptual = index == self.num_steps
             perceptual_loss = (
-                self.perceptual_loss_fn(normalized_prediction, normalized_target)
+                self.perceptual_loss_fn(prediction, target)
                 if apply_perceptual and self.perceptual_weight != 0.0 and self.perceptual_loss_fn is not None
                 else base_loss.new_zeros(())
             )
             loss = base_loss + self.perceptual_weight * perceptual_loss
             step_losses.append(loss)
             step_perceptual_losses.append(perceptual_loss)
-            total = loss if total is None else total + loss
-        if total is None:
+        if not step_losses:
             raise RuntimeError("step loss list must not be empty")
         weight_sum = float(sum(self.step_weights))
         weighted_scale_total = sum(
@@ -182,7 +191,7 @@ class IterativeStepLoss(nn.Module):
             if latent_input is None:
                 raise ValueError("latent_input must be provided when latent_diversity_weight is non-zero")
             latent_diversity_loss = self._latent_diversity_loss(
-                prediction=self._normalize_image(predictions[0]),
+                prediction=predictions[0],
                 latent_input=latent_input,
             )
         final_loss = step_losses[-1]
@@ -191,6 +200,9 @@ class IterativeStepLoss(nn.Module):
             "total_loss": scale_loss + self.latent_diversity_weight * latent_diversity_loss,
             "final_loss": final_loss,
             "scale_loss": scale_loss,
+            "band_loss": scale_loss.new_zeros(()),
+            "tv_loss": scale_loss.new_zeros(()),
+            "background_loss": scale_loss.new_zeros(()),
             "perceptual_loss": final_perceptual,
             "latent_diversity_loss": latent_diversity_loss,
             "scale_losses": tuple(step_losses),
@@ -477,14 +489,21 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
         max_steps_per_epoch = train_cfg.get("max_steps_per_epoch")
         grad_clip_norm = train_cfg.get("grad_clip_norm")
         latest_metrics: dict[str, Any] = {}
+        optimizer_group_lrs = {
+            str(group.get("group_name", f"group_{index}")): float(group["lr"])
+            for index, group in enumerate(optimizer.param_groups)
+        }
 
         for epoch_idx in range(max_epochs):
             model.train()
             running_total = 0.0
             running_final = 0.0
+            running_scale = 0.0
+            running_band = 0.0
+            running_tv = 0.0
+            running_background = 0.0
             running_latent_div = 0.0
             running_perceptual = 0.0
-            step_running = [0.0 for _ in range(num_steps)]
             step_count = 0
 
             for batch_idx, batch in enumerate(loader, start=1):
@@ -509,23 +528,26 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
 
                 running_total += float(total_loss.detach().cpu())
                 running_final += float(loss_output["final_loss"].detach().cpu())
+                running_scale += float(loss_output["scale_loss"].detach().cpu())
+                running_band += float(loss_output["band_loss"].detach().cpu())
+                running_tv += float(loss_output["tv_loss"].detach().cpu())
+                running_background += float(loss_output["background_loss"].detach().cpu())
                 running_perceptual += float(loss_output["perceptual_loss"].detach().cpu())
                 latent_div_value = float(loss_output["latent_diversity_loss"].detach().cpu())
                 running_latent_div += latent_div_value
-                for index, step_loss in enumerate(loss_output["scale_losses"]):
-                    step_running[index] += float(step_loss.detach().cpu())
                 step_count += 1
 
                 if batch_idx % log_interval == 0:
-                    step_means = [value / step_count for value in step_running]
-                    scale_mean = sum(step_means) / float(num_steps)
                     print(
                         f"[epoch {epoch_idx + 1}/{max_epochs}] step={batch_idx} "
                         f"total={running_total / step_count:.6f} "
                         f"final={running_final / step_count:.6f} "
-                        f"scale={scale_mean:.6f} "
+                        f"scale={running_scale / step_count:.6f} "
+                        f"band={running_band / step_count:.6f} "
+                        f"tv={running_tv / step_count:.6f} "
+                        f"bg={running_background / step_count:.6f} "
+                        f"perc={running_perceptual / step_count:.6f} "
                         f"latent_div={running_latent_div / step_count:.6f} "
-                        f"scale_losses={step_means}"
                     )
 
                 if max_steps_per_epoch is not None and batch_idx >= int(max_steps_per_epoch):
@@ -534,23 +556,28 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
             if step_count == 0:
                 raise RuntimeError("training dataloader produced zero steps")
 
-            scale_means = [value / step_count for value in step_running]
-            scale_mean = sum(scale_means) / float(num_steps)
             latest_metrics = {
                 "epoch": epoch_idx + 1,
                 "total_loss": running_total / step_count,
                 "final_loss": running_final / step_count,
-                "scale_loss": scale_mean,
+                "scale_loss": running_scale / step_count,
+                "band_loss": running_band / step_count,
+                "tv_loss": running_tv / step_count,
+                "background_loss": running_background / step_count,
                 "perceptual_loss": running_perceptual / step_count,
                 "latent_diversity_loss": running_latent_div / step_count,
-                "scale_losses": scale_means,
+                "optimizer_lrs": optimizer_group_lrs,
             }
             print(
                 f"[epoch {epoch_idx + 1}/{max_epochs}] total={latest_metrics['total_loss']:.6f} "
                 f"final={latest_metrics['final_loss']:.6f} "
                 f"scale={latest_metrics['scale_loss']:.6f} "
+                f"band={latest_metrics['band_loss']:.6f} "
+                f"tv={latest_metrics['tv_loss']:.6f} "
+                f"bg={latest_metrics['background_loss']:.6f} "
+                f"perc={latest_metrics['perceptual_loss']:.6f} "
                 f"latent_div={latest_metrics['latent_diversity_loss']:.6f} "
-                f"scale_losses={latest_metrics['scale_losses']}"
+                f"lrs={latest_metrics['optimizer_lrs']}"
             )
             _append_jsonl(history_path, latest_metrics)
             torch.save(

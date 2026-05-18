@@ -193,8 +193,12 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             self.assertIn("total_loss", payload)
             self.assertIn("final_loss", payload)
             self.assertIn("scale_loss", payload)
+            self.assertIn("band_loss", payload)
+            self.assertIn("tv_loss", payload)
+            self.assertIn("background_loss", payload)
+            self.assertIn("perceptual_loss", payload)
             self.assertIn("latent_diversity_loss", payload)
-            self.assertEqual(len(payload["scale_losses"]), 3)
+            self.assertIn("optimizer_lrs", payload)
 
     def test_train_requires_num_steps_match_num_levels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
