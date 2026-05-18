@@ -57,17 +57,18 @@ def _save_panel(path: Path, image: torch.Tensor, *, cmap: str, title: str) -> No
 def _save_step_grid(
     path: Path,
     *,
-    target: torch.Tensor,
+    targets: tuple[torch.Tensor, ...],
     predictions: tuple[torch.Tensor, ...],
     states: tuple[torch.Tensor, ...],
 ) -> None:
-    total_items = 1 + len(predictions) + len(states)
+    total_items = len(targets) + len(predictions) + len(states)
     cols = 3
     rows = math.ceil(total_items / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
     axes_list = list(axes.reshape(-1)) if hasattr(axes, "reshape") else [axes]
 
-    panels: list[tuple[str, torch.Tensor]] = [("target", target)]
+    panels: list[tuple[str, torch.Tensor]] = []
+    panels.extend((f"target_{index:02d}", tensor) for index, tensor in enumerate(targets, start=1))
     panels.extend((f"pred_{index:02d}", tensor) for index, tensor in enumerate(predictions, start=1))
     panels.extend((f"state_{index:02d}", tensor) for index, tensor in enumerate(states, start=1))
 
@@ -145,15 +146,22 @@ def main(argv: list[str] | None = None) -> None:
 
     predictions = output["predictions"]
     states = output["states"]
-    target = batch[f"target_scale_{num_steps}"]
+    targets = tuple(batch[f"target_scale_{index}"] for index in range(1, num_steps + 1))
     prefix_base = f"sample_{int(args.sample_index):04d}"
 
     _save_panel(
         args.output_dir / f"{prefix_base}_target.png",
-        target,
+        targets[-1],
         cmap="gray",
         title="target_final",
     )
+    for index, target in enumerate(targets, start=1):
+        _save_panel(
+            args.output_dir / f"{prefix_base}_target_scale_{index:02d}.png",
+            target,
+            cmap="gray",
+            title=f"target_scale_{index}",
+        )
     for index, prediction in enumerate(predictions, start=1):
         _save_panel(
             args.output_dir / f"{prefix_base}_step_{index:02d}.png",
@@ -170,7 +178,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     _save_step_grid(
         args.output_dir / f"{prefix_base}_overview.png",
-        target=target,
+        targets=targets,
         predictions=predictions,
         states=states,
     )

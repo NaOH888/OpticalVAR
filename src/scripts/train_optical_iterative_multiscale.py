@@ -98,9 +98,10 @@ class IterativeStepLoss(nn.Module):
             normalized_prediction = self._normalize_image(prediction)
             normalized_target = self._normalize_image(target.to(dtype=torch.float32))
             base_loss = self._base_loss(normalized_prediction, normalized_target)
+            apply_perceptual = index == self.num_steps
             perceptual_loss = (
                 self.perceptual_loss_fn(normalized_prediction, normalized_target)
-                if self.perceptual_weight != 0.0 and self.perceptual_loss_fn is not None
+                if apply_perceptual and self.perceptual_weight != 0.0 and self.perceptual_loss_fn is not None
                 else base_loss.new_zeros(())
             )
             loss = base_loss + self.perceptual_weight * perceptual_loss
@@ -111,12 +112,12 @@ class IterativeStepLoss(nn.Module):
             raise RuntimeError("step loss list must not be empty")
         scale_loss = total / float(self.num_steps)
         final_loss = step_losses[-1]
-        mean_perceptual = torch.stack(step_perceptual_losses).mean() if step_perceptual_losses else final_loss.new_zeros(())
+        final_perceptual = step_perceptual_losses[-1] if step_perceptual_losses else final_loss.new_zeros(())
         return {
             "total_loss": scale_loss,
             "final_loss": final_loss,
             "scale_loss": scale_loss,
-            "perceptual_loss": mean_perceptual,
+            "perceptual_loss": final_perceptual,
             "scale_losses": tuple(step_losses),
         }
 

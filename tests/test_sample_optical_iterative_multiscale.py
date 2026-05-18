@@ -35,6 +35,8 @@ class SampleOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             )
 
             self.assertTrue((sample_outputs_dir / "sample_0001_target.png").exists())
+            self.assertTrue((sample_outputs_dir / "sample_0001_target_scale_01.png").exists())
+            self.assertTrue((sample_outputs_dir / "sample_0001_target_scale_03.png").exists())
             self.assertTrue((sample_outputs_dir / "sample_0001_step_01.png").exists())
             self.assertTrue((sample_outputs_dir / "sample_0001_step_03.png").exists())
             self.assertTrue((sample_outputs_dir / "sample_0001_state_01.png").exists())
