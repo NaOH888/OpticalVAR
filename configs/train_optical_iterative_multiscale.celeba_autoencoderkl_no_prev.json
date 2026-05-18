@@ -1,0 +1,111 @@
+{
+  "runtime": {
+    "seed": 42,
+    "device": "cuda"
+  },
+  "dataset": {
+    "manifest_path": "dataset/celeba_autoencoderkl/celeba_train_autoencoderkl_lm.json",
+    "channel_mode": "keep",
+    "batch_size": 8,
+    "shuffle": true,
+    "num_workers": 0,
+    "drop_last": false,
+    "max_items": null
+  },
+  "multiscale": {
+    "num_levels": 5,
+    "cutoffs": [0.04, 0.08, 0.16, 0.32],
+    "transition_width": 0.05
+  },
+  "iterative": {
+    "num_steps": 5,
+    "detach_prev_state": false,
+    "initial_state": "zeros",
+    "step_embedding_dim": 64,
+    "state_normalization": "mean_power",
+    "use_prev_image": false
+  },
+  "encoder": {
+    "latent_channels": [64, 48, 32, 24],
+    "prev_image_channels": [32, 24, 16],
+    "condition_mode": "attribute_vector",
+    "condition_input_dim": 50,
+    "condition_embed_dim": 128,
+    "condition_hidden_dim": 256,
+    "fusion_hidden_dim": 128,
+    "class_embed_dim": 128,
+    "output_height": 176,
+    "output_width": 176,
+    "weight_init": "kaiming_uniform",
+    "output_weight_init": "xavier_uniform",
+    "upsample_mode": "bilinear"
+  },
+  "optical": {
+    "num_layers": 3,
+    "source": {
+      "wavelengths_m": [5.32e-7],
+      "light_mode": "phase",
+      "amplitude": 1.0
+    },
+    "slm": {
+      "pixel_pitch_x_m": 2.0e-6,
+      "pixel_pitch_y_m": 2.0e-6,
+      "pixel_count_x": 176,
+      "pixel_count_y": 176,
+      "dx_m": 1.0e-6,
+      "fill_factor": 1.0,
+      "phase_alpha": 2.0,
+      "phase_bit_depth": null
+    },
+    "phase_layer": {
+      "alpha_pi": 2.0,
+      "modulation_mode": "phase",
+      "share_across_channels": true,
+      "init_mode": "uniform",
+      "init_min_rad": 0.0,
+      "init_max_rad": 6.283185307179586,
+      "phase_grid_height": 176,
+      "phase_grid_width": 176,
+      "phase_pitch_x_m": 1.0e-6,
+      "phase_pitch_y_m": 1.0e-6
+    },
+    "detector": {
+      "width_num": 176,
+      "height_num": 176,
+      "detector_unit_len_m": 2.0e-6
+    },
+    "propagation": {
+      "canvas_h": null,
+      "canvas_w": null,
+      "canvas_factor": 2.0,
+      "refractive_index": 1.0,
+      "use_bandlimit_window": false,
+      "evanescent_mode": "keep",
+      "fft_norm": "ortho"
+    },
+    "error": {
+      "delta_z_m": 0.0,
+      "shift_x_m": 0.0,
+      "shift_y_m": 0.0,
+      "error_factor": 1.0
+    },
+    "distances_m": {
+      "slm_to_first_layer_m": 1.0e-3,
+      "between_layers_m": [1.0e-3, 1.0e-3],
+      "last_layer_to_detector_m": 1.0e-3
+    }
+  },
+  "loss": {
+    "loss_type": "l1",
+    "perceptual_weight": 0.0
+  },
+  "training": {
+    "epochs": 50,
+    "lr": 0.001,
+    "weight_decay": 0.0,
+    "grad_clip_norm": 1.0,
+    "log_interval": 10,
+    "max_steps_per_epoch": null,
+    "output_dir": "outputs/train_optical_iterative_multiscale/celeba_autoencoderkl_no_prev"
+  }
+}

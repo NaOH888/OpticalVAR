@@ -217,6 +217,18 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             self.assertTrue((outputs_dir / "latest.pt").exists())
             self.assertIn("metrics", result)
 
+    def test_train_supports_disabling_prev_image_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path, outputs_dir = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["iterative"]["use_prev_image"] = False
+
+            result = train(config, config_path=config_path)
+
+            self.assertTrue((outputs_dir / "latest.pt").exists())
+            self.assertIn("metrics", result)
+
 
 if __name__ == "__main__":
     unittest.main()

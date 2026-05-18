@@ -33,6 +33,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         condition_embed_dim: int | None = None,
         latent_stage_channels: Sequence[int] | None = None,
         prev_image_channels: Sequence[int] | None = None,
+        use_prev_image: bool = True,
         fusion_hidden_dim: int = 128,
         weight_init: str = "kaiming_uniform",
         output_weight_init: str = "xavier_uniform",
@@ -48,6 +49,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         self.step_embedding_dim = int(step_embedding_dim)
         self.condition_layer = condition_layer
         self.condition_embed_dim = None if condition_embed_dim is None else int(condition_embed_dim)
+        self.use_prev_image = bool(use_prev_image)
         self.fusion_hidden_dim = int(fusion_hidden_dim)
         self.weight_init = str(weight_init)
         self.output_weight_init = str(output_weight_init)
@@ -92,28 +94,33 @@ class IterativeMultiscaleEncoder(nn.Module):
         self.prev_feature_channels = tuple(prev_feature_channels[: len(self.stage_sizes)])
 
         self.latent_stem = nn.Conv2d(self.latent_channels, self.latent_stage_channels[0], kernel_size=1, bias=True)
-        self.prev_stem = nn.Conv2d(1, self.prev_image_channels[0], kernel_size=3, stride=1, padding=1, bias=True)
-        prev_blocks: list[nn.Module] = []
-        for in_channels, out_channels in zip(self.prev_image_channels[:-1], self.prev_image_channels[1:]):
-            prev_blocks.append(
-                nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
-                    nn.GroupNorm(num_groups=1, num_channels=out_channels),
-                    nn.SiLU(),
+        if self.use_prev_image:
+            self.prev_stem = nn.Conv2d(1, self.prev_image_channels[0], kernel_size=3, stride=1, padding=1, bias=True)
+            prev_blocks: list[nn.Module] = []
+            for in_channels, out_channels in zip(self.prev_image_channels[:-1], self.prev_image_channels[1:]):
+                prev_blocks.append(
+                    nn.Sequential(
+                        nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
+                        nn.GroupNorm(num_groups=1, num_channels=out_channels),
+                        nn.SiLU(),
+                    )
                 )
+            self.prev_blocks = nn.ModuleList(prev_blocks)
+            self.prev_projectors = nn.ModuleList(
+                [
+                    nn.Conv2d(
+                        self.prev_feature_channels[index],
+                        self.latent_stage_channels[index],
+                        kernel_size=1,
+                        bias=True,
+                    )
+                    for index in range(len(self.stage_sizes))
+                ]
             )
-        self.prev_blocks = nn.ModuleList(prev_blocks)
-        self.prev_projectors = nn.ModuleList(
-            [
-                nn.Conv2d(
-                    self.prev_feature_channels[index],
-                    self.latent_stage_channels[index],
-                    kernel_size=1,
-                    bias=True,
-                )
-                for index in range(len(self.stage_sizes))
-            ]
-        )
+        else:
+            self.prev_stem = None
+            self.prev_blocks = None
+            self.prev_projectors = None
         self.stage_projectors = nn.ModuleList(
             [
                 nn.Identity()
@@ -151,12 +158,15 @@ class IterativeMultiscaleEncoder(nn.Module):
 
     def _reset_parameters(self) -> None:
         _init_linear_or_conv(self.latent_stem, self.weight_init)
-        _init_linear_or_conv(self.prev_stem, self.weight_init)
-        for block in self.prev_blocks:
-            conv = block[0]
-            _init_linear_or_conv(conv, self.weight_init)
-        for projector in self.prev_projectors:
-            _init_linear_or_conv(projector, self.weight_init)
+        if self.prev_stem is not None:
+            _init_linear_or_conv(self.prev_stem, self.weight_init)
+        if self.prev_blocks is not None:
+            for block in self.prev_blocks:
+                conv = block[0]
+                _init_linear_or_conv(conv, self.weight_init)
+        if self.prev_projectors is not None:
+            for projector in self.prev_projectors:
+                _init_linear_or_conv(projector, self.weight_init)
         for projector in self.stage_projectors:
             if isinstance(projector, nn.Conv2d):
                 _init_linear_or_conv(projector, self.weight_init)
@@ -182,6 +192,8 @@ class IterativeMultiscaleEncoder(nn.Module):
                         _init_linear_or_conv(module, self.weight_init)
 
     def _encode_prev_image(self, prev_image: torch.Tensor) -> list[torch.Tensor]:
+        if not self.use_prev_image or self.prev_stem is None or self.prev_blocks is None:
+            raise RuntimeError("_encode_prev_image should not be called when use_prev_image is disabled")
         if prev_image.dim() != 4 or int(prev_image.shape[1]) != 1:
             raise ValueError(f"prev_image must be [B,1,H,W], got {tuple(prev_image.shape)}")
         hidden = self.prev_stem(prev_image.to(dtype=torch.float32))
@@ -259,7 +271,7 @@ class IterativeMultiscaleEncoder(nn.Module):
                 f"got {tuple(latent_base.shape)}"
             )
         batch_size = int(latent_base.shape[0])
-        prev_features = self._encode_prev_image(prev_image)
+        prev_features = self._encode_prev_image(prev_image) if self.use_prev_image else None
         conditioning_repr = self._build_conditioning_repr_from_base(
             batch_size=batch_size,
             device=latent_base.device,
@@ -271,8 +283,9 @@ class IterativeMultiscaleEncoder(nn.Module):
         for index, (target_size, block) in enumerate(zip(self.stage_sizes, self.blocks)):
             hidden = _interpolate_like(hidden, size=target_size, mode=self.upsample_mode)
             hidden = self.stage_projectors[index](hidden)
-            prev_feature = _interpolate_like(prev_features[index], size=target_size, mode=self.upsample_mode)
-            hidden = hidden + self.prev_projectors[index](prev_feature)
+            if prev_features is not None and self.prev_projectors is not None:
+                prev_feature = _interpolate_like(prev_features[index], size=target_size, mode=self.upsample_mode)
+                hidden = hidden + self.prev_projectors[index](prev_feature)
             hidden = block(hidden, conditioning_repr)
         return self.head(hidden)
 
