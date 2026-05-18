@@ -251,6 +251,24 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             self.assertIn("metrics", result)
             self.assertIn("latent_diversity_loss", result["metrics"])
 
+    def test_train_supports_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path, outputs_dir = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+
+            first_result = train(config, config_path=config_path)
+            latest_checkpoint = Path(first_result["latest_checkpoint"])
+            self.assertTrue(latest_checkpoint.exists())
+
+            config["training"]["epochs"] = 2
+            second_result = train(config, config_path=config_path, resume_path_override=latest_checkpoint)
+
+            self.assertEqual(second_result["metrics"]["epoch"], 2)
+            self.assertEqual(second_result["resumed_from"], str(latest_checkpoint))
+            history_lines = (outputs_dir / "history.jsonl").read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(history_lines), 2)
+
     def test_iterative_step_loss_supports_step_weights(self) -> None:
         criterion = IterativeStepLoss(
             num_steps=3,

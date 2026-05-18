@@ -456,12 +456,48 @@ def _build_optimizer(model: IterativeMultiscaleOpticalModel, *, train_cfg: dict[
     )
 
 
+def _resolve_resume_path(
+    train_cfg: dict[str, Any],
+    *,
+    cli_resume: str | None,
+    config_dir: Path,
+    repo_root: Path,
+) -> Path | None:
+    raw_value = cli_resume if cli_resume is not None else train_cfg.get("resume_from")
+    if raw_value is None:
+        return None
+    return _resolve_path(str(raw_value), config_dir=config_dir, repo_root=repo_root)
+
+
+def _load_resume_checkpoint(
+    *,
+    model: IterativeMultiscaleOpticalModel,
+    optimizer: torch.optim.Optimizer,
+    resume_path: Path,
+    device: torch.device,
+    resume_optimizer: bool,
+    resume_strict: bool,
+) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model"], strict=resume_strict)
+    if resume_optimizer and "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    metrics = dict(checkpoint.get("metrics", {}))
+    start_epoch = int(checkpoint.get("epoch", metrics.get("epoch", 0)))
+    return start_epoch, metrics, checkpoint
+
+
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
+def train(
+    config: dict[str, Any],
+    *,
+    config_path: Path,
+    resume_path_override: Path | None = None,
+) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parents[2]
     config_dir = config_path.resolve().parent
     runtime_cfg = dict(config.get("runtime", {}))
@@ -475,6 +511,12 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
 
     _seed_everything(int(runtime_cfg.get("seed", 42)))
     device = torch.device(str(runtime_cfg.get("device", "cpu")))
+    resume_path = resume_path_override or _resolve_resume_path(
+        train_cfg,
+        cli_resume=None,
+        config_dir=config_dir,
+        repo_root=repo_root,
+    )
     dataset, loader = _build_dataset_and_loader(config, config_dir=config_dir, repo_root=repo_root)
     try:
         sample_item = dataset[0]
@@ -492,12 +534,38 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
         max_steps_per_epoch = train_cfg.get("max_steps_per_epoch")
         grad_clip_norm = train_cfg.get("grad_clip_norm")
         latest_metrics: dict[str, Any] = {}
+        start_epoch = 0
+        resumed_from: str | None = None
+        previous_metrics: dict[str, Any] | None = None
         optimizer_group_lrs = {
             str(group.get("group_name", f"group_{index}")): float(group["lr"])
             for index, group in enumerate(optimizer.param_groups)
         }
 
-        for epoch_idx in range(max_epochs):
+        if resume_path is not None:
+            resume_optimizer = bool(train_cfg.get("resume_optimizer", True))
+            resume_strict = bool(train_cfg.get("resume_strict", True))
+            start_epoch, previous_metrics, _ = _load_resume_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                resume_path=resume_path,
+                device=device,
+                resume_optimizer=resume_optimizer,
+                resume_strict=resume_strict,
+            )
+            resumed_from = str(resume_path)
+            print(
+                f"[resume] path={resume_path} start_epoch={start_epoch} "
+                f"resume_optimizer={resume_optimizer} resume_strict={resume_strict}"
+            )
+            if previous_metrics:
+                print(f"[resume] previous_metrics={json.dumps(previous_metrics, ensure_ascii=False)}")
+        if start_epoch >= max_epochs:
+            raise ValueError(
+                f"training.epochs={max_epochs} must be greater than resumed epoch {start_epoch}"
+            )
+
+        for epoch_idx in range(start_epoch, max_epochs):
             model.train()
             running_total = 0.0
             running_final = 0.0
@@ -607,6 +675,8 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
             "latest_checkpoint": str(output_dir / "latest.pt"),
             "history_path": str(history_path),
             "metrics": latest_metrics,
+            "resumed_from": resumed_from,
+            "previous_metrics": previous_metrics,
         }
     finally:
         dataset.base_dataset.close()
@@ -615,13 +685,18 @@ def train(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the iterative multiscale optical model.")
     parser.add_argument("--config", type=Path, required=True, help="Path to JSON/YAML config file.")
+    parser.add_argument("--resume-from", type=Path, default=None, help="Optional checkpoint path to resume from.")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     config_path = args.config.resolve()
-    result = train(_load_config(config_path), config_path=config_path)
+    result = train(
+        _load_config(config_path),
+        config_path=config_path,
+        resume_path_override=args.resume_from.resolve() if args.resume_from is not None else None,
+    )
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
