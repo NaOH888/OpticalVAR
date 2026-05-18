@@ -7,13 +7,14 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from scripts.train_optical_iterative_multiscale import main, train
+from scripts.train_optical_iterative_multiscale import IterativeStepLoss, main, train
 
 
 class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
@@ -243,6 +244,53 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             self.assertTrue((outputs_dir / "latest.pt").exists())
             self.assertIn("metrics", result)
             self.assertIn("latent_diversity_loss", result["metrics"])
+
+    def test_iterative_step_loss_supports_step_weights(self) -> None:
+        criterion = IterativeStepLoss(
+            num_steps=3,
+            loss_type="l1",
+            step_weights=[4.0, 2.0, 1.0],
+            perceptual_weight=0.0,
+            state_normalization="mean_power",
+        )
+        predictions = (
+            torch.tensor(
+                [[[[1.0, 0.0], [0.0, 0.0]]], [[[0.0, 1.0], [0.0, 0.0]]]],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [[[[1.0, 1.0], [0.0, 0.0]]], [[[0.0, 1.0], [1.0, 0.0]]]],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [[[[1.0, 1.0], [1.0, 0.0]]], [[[0.0, 1.0], [1.0, 1.0]]]],
+                dtype=torch.float32,
+            ),
+        )
+        batch = {
+            "target_scale_1": torch.tensor(
+                [[[[1.0, 1.0], [0.0, 0.0]]], [[[1.0, 0.0], [0.0, 0.0]]]],
+                dtype=torch.float32,
+            ),
+            "target_scale_2": torch.tensor(
+                [[[[1.0, 0.0], [1.0, 0.0]]], [[[0.0, 0.0], [1.0, 1.0]]]],
+                dtype=torch.float32,
+            ),
+            "target_scale_3": torch.tensor(
+                [[[[1.0, 0.0], [0.0, 1.0]]], [[[1.0, 0.0], [1.0, 0.0]]]],
+                dtype=torch.float32,
+            ),
+        }
+        output = criterion(predictions=predictions, batch=batch)
+
+        scale_losses = output["scale_losses"]
+        self.assertEqual(len(scale_losses), 3)
+        expected_weighted = (
+            4.0 * float(scale_losses[0].detach().cpu())
+            + 2.0 * float(scale_losses[1].detach().cpu())
+            + 1.0 * float(scale_losses[2].detach().cpu())
+        ) / 7.0
+        self.assertAlmostEqual(float(output["scale_loss"].detach().cpu()), expected_weighted, places=6)
 
 
 if __name__ == "__main__":

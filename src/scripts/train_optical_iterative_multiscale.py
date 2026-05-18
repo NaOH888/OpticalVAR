@@ -43,6 +43,7 @@ class IterativeStepLoss(nn.Module):
         *,
         num_steps: int,
         loss_type: str = "l1",
+        step_weights: list[float] | tuple[float, ...] | None = None,
         perceptual_weight: float = 0.0,
         perceptual_loss_fn: nn.Module | None = None,
         latent_diversity_weight: float = 0.0,
@@ -52,6 +53,10 @@ class IterativeStepLoss(nn.Module):
         super().__init__()
         self.num_steps = int(num_steps)
         self.loss_type = str(loss_type)
+        if step_weights is None:
+            self.step_weights = tuple(1.0 for _ in range(self.num_steps))
+        else:
+            self.step_weights = tuple(float(value) for value in step_weights)
         self.perceptual_weight = float(perceptual_weight)
         self.perceptual_loss_fn = perceptual_loss_fn
         self.latent_diversity_weight = float(latent_diversity_weight)
@@ -61,6 +66,12 @@ class IterativeStepLoss(nn.Module):
             raise ValueError("num_steps must be positive")
         if self.loss_type not in {"l1", "mse"}:
             raise ValueError(f"loss_type must be 'l1' or 'mse', got {self.loss_type!r}")
+        if len(self.step_weights) != self.num_steps:
+            raise ValueError(
+                f"step_weights length must equal num_steps={self.num_steps}, got {len(self.step_weights)}"
+            )
+        if any(value <= 0.0 for value in self.step_weights):
+            raise ValueError("step_weights must all be positive")
         if self.perceptual_weight != 0.0 and self.perceptual_loss_fn is None:
             raise ValueError("perceptual_loss_fn must be provided when perceptual_weight is non-zero")
         if self.state_normalization != "mean_power":
@@ -161,7 +172,11 @@ class IterativeStepLoss(nn.Module):
             total = loss if total is None else total + loss
         if total is None:
             raise RuntimeError("step loss list must not be empty")
-        scale_loss = total / float(self.num_steps)
+        weight_sum = float(sum(self.step_weights))
+        weighted_scale_total = sum(
+            weight * loss for weight, loss in zip(self.step_weights, step_losses)
+        )
+        scale_loss = weighted_scale_total / weight_sum
         latent_diversity_loss = scale_loss.new_zeros(())
         if self.latent_diversity_weight != 0.0:
             if latent_input is None:
@@ -407,6 +422,7 @@ def _build_loss(config: dict[str, Any], *, device: torch.device, num_steps: int)
     return IterativeStepLoss(
         num_steps=num_steps,
         loss_type=str(loss_cfg.get("loss_type", "l1")),
+        step_weights=loss_cfg.get("step_weights"),
         perceptual_weight=float(loss_cfg.get("perceptual_weight", 0.0)),
         perceptual_loss_fn=perceptual_loss_fn,
         latent_diversity_weight=float(loss_cfg.get("latent_diversity_weight", 0.0)),
