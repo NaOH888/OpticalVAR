@@ -192,6 +192,7 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             self.assertIn("total_loss", payload)
             self.assertIn("final_loss", payload)
             self.assertIn("scale_loss", payload)
+            self.assertIn("latent_diversity_loss", payload)
             self.assertEqual(len(payload["scale_losses"]), 3)
 
     def test_train_requires_num_steps_match_num_levels(self) -> None:
@@ -228,6 +229,20 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
 
             self.assertTrue((outputs_dir / "latest.pt").exists())
             self.assertIn("metrics", result)
+
+    def test_train_supports_step1_latent_diversity_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path, outputs_dir = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["loss"]["latent_diversity_weight"] = 0.5
+            config["loss"]["latent_diversity_margin"] = 0.1
+
+            result = train(config, config_path=config_path)
+
+            self.assertTrue((outputs_dir / "latest.pt").exists())
+            self.assertIn("metrics", result)
+            self.assertIn("latent_diversity_loss", result["metrics"])
 
 
 if __name__ == "__main__":
