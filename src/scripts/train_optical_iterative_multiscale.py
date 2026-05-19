@@ -43,35 +43,57 @@ class IterativeStepLoss(nn.Module):
         *,
         num_steps: int,
         loss_type: str = "l1",
+        scale_weight: float = 1.0,
+        final_weight: float = 1.0,
         step_weights: list[float] | tuple[float, ...] | None = None,
         perceptual_weight: float = 0.0,
         perceptual_loss_fn: nn.Module | None = None,
         latent_diversity_weight: float = 0.0,
         latent_diversity_margin: float = 0.05,
+        latent_div_step_weights: list[float] | tuple[float, ...] | None = None,
         state_normalization: str = "mean_power",
     ) -> None:
         super().__init__()
         self.num_steps = int(num_steps)
         self.loss_type = str(loss_type)
+        self.scale_weight = float(scale_weight)
+        self.final_weight = float(final_weight)
+        self.scale_step_count = max(self.num_steps - 1, 0)
         if step_weights is None:
-            self.step_weights = tuple(1.0 for _ in range(self.num_steps))
+            self.step_weights = tuple(1.0 for _ in range(self.scale_step_count))
         else:
             self.step_weights = tuple(float(value) for value in step_weights)
         self.perceptual_weight = float(perceptual_weight)
         self.perceptual_loss_fn = perceptual_loss_fn
         self.latent_diversity_weight = float(latent_diversity_weight)
         self.latent_diversity_margin = float(latent_diversity_margin)
+        if latent_div_step_weights is None:
+            self.latent_div_step_weights = tuple(1.0 for _ in range(self.num_steps))
+        else:
+            self.latent_div_step_weights = tuple(float(value) for value in latent_div_step_weights)
         self.state_normalization = str(state_normalization)
         if self.num_steps <= 0:
             raise ValueError("num_steps must be positive")
         if self.loss_type not in {"l1", "mse"}:
             raise ValueError(f"loss_type must be 'l1' or 'mse', got {self.loss_type!r}")
-        if len(self.step_weights) != self.num_steps:
+        if self.scale_weight < 0.0:
+            raise ValueError("scale_weight must be non-negative")
+        if self.final_weight < 0.0:
+            raise ValueError("final_weight must be non-negative")
+        if len(self.step_weights) != self.scale_step_count:
             raise ValueError(
-                f"step_weights length must equal num_steps={self.num_steps}, got {len(self.step_weights)}"
+                "step_weights length must equal num_steps - 1="
+                f"{self.scale_step_count}, got {len(self.step_weights)}"
             )
         if any(value <= 0.0 for value in self.step_weights):
             raise ValueError("step_weights must all be positive")
+        if len(self.latent_div_step_weights) != self.num_steps:
+            raise ValueError(
+                f"latent_div_step_weights length must equal num_steps={self.num_steps}, "
+                f"got {len(self.latent_div_step_weights)}"
+            )
+        if any(value <= 0.0 for value in self.latent_div_step_weights):
+            raise ValueError("latent_div_step_weights must all be positive")
         if self.perceptual_weight != 0.0 and self.perceptual_loss_fn is None:
             raise ValueError("perceptual_loss_fn must be provided when perceptual_weight is non-zero")
         if self.state_normalization != "mean_power":
@@ -161,6 +183,7 @@ class IterativeStepLoss(nn.Module):
             raise ValueError(f"expected {self.num_steps} predictions, got {len(predictions)}")
         step_losses: list[torch.Tensor] = []
         step_perceptual_losses: list[torch.Tensor] = []
+        step_latent_div_losses: list[torch.Tensor] = []
         for index, prediction in enumerate(predictions, start=1):
             target_key = f"target_scale_{index}"
             if target_key not in batch:
@@ -178,26 +201,38 @@ class IterativeStepLoss(nn.Module):
             )
             step_losses.append(base_loss)
             step_perceptual_losses.append(perceptual_loss)
+            if self.latent_diversity_weight != 0.0:
+                if latent_input is None:
+                    raise ValueError("latent_input must be provided when latent_diversity_weight is non-zero")
+                step_latent_div_losses.append(
+                    self._latent_diversity_loss(
+                        prediction=prediction,
+                        latent_input=latent_input,
+                    )
+                )
+            else:
+                step_latent_div_losses.append(base_loss.new_zeros(()))
         if not step_losses:
             raise RuntimeError("step loss list must not be empty")
-        weight_sum = float(sum(self.step_weights))
-        weighted_scale_total = sum(
-            weight * loss for weight, loss in zip(self.step_weights, step_losses)
-        )
-        scale_loss = weighted_scale_total / weight_sum
-        latent_diversity_loss = scale_loss.new_zeros(())
-        if self.latent_diversity_weight != 0.0:
-            if latent_input is None:
-                raise ValueError("latent_input must be provided when latent_diversity_weight is non-zero")
-            latent_diversity_loss = self._latent_diversity_loss(
-                prediction=predictions[0],
-                latent_input=latent_input,
+        scale_step_losses = tuple(step_losses[:-1])
+        if self.scale_step_count > 0:
+            weight_sum = float(sum(self.step_weights))
+            weighted_scale_total = sum(
+                weight * loss for weight, loss in zip(self.step_weights, scale_step_losses)
             )
+            scale_loss = weighted_scale_total / weight_sum
+        else:
+            scale_loss = step_losses[-1].new_zeros(())
+        latent_div_weight_sum = float(sum(self.latent_div_step_weights))
+        latent_diversity_loss = sum(
+            weight * loss for weight, loss in zip(self.latent_div_step_weights, step_latent_div_losses)
+        ) / latent_div_weight_sum
         final_loss = step_losses[-1]
         final_perceptual = step_perceptual_losses[-1] if step_perceptual_losses else final_loss.new_zeros(())
         return {
             "total_loss": (
-                scale_loss
+                self.scale_weight * scale_loss
+                + self.final_weight * final_loss
                 + self.perceptual_weight * final_perceptual
                 + self.latent_diversity_weight * latent_diversity_loss
             ),
@@ -208,7 +243,7 @@ class IterativeStepLoss(nn.Module):
             "background_loss": scale_loss.new_zeros(()),
             "perceptual_loss": final_perceptual,
             "latent_diversity_loss": latent_diversity_loss,
-            "scale_losses": tuple(step_losses),
+            "scale_losses": scale_step_losses,
         }
 
 
@@ -438,11 +473,14 @@ def _build_loss(config: dict[str, Any], *, device: torch.device, num_steps: int)
     return IterativeStepLoss(
         num_steps=num_steps,
         loss_type=str(loss_cfg.get("loss_type", "l1")),
+        scale_weight=float(loss_cfg.get("scale_weight", 1.0)),
+        final_weight=float(loss_cfg.get("final_weight", 1.0)),
         step_weights=loss_cfg.get("step_weights"),
         perceptual_weight=float(loss_cfg.get("perceptual_weight", 0.0)),
         perceptual_loss_fn=perceptual_loss_fn,
         latent_diversity_weight=float(loss_cfg.get("latent_diversity_weight", 0.0)),
         latent_diversity_margin=float(loss_cfg.get("latent_diversity_margin", 0.05)),
+        latent_div_step_weights=loss_cfg.get("latent_div_step_weights"),
         state_normalization=str(iterative_cfg.get("state_normalization", "mean_power")),
     )
 
@@ -593,7 +631,7 @@ def train(
             running_background = 0.0
             running_latent_div = 0.0
             running_perceptual = 0.0
-            running_scale_steps = [0.0 for _ in range(num_steps)]
+            running_scale_steps = [0.0 for _ in range(max(num_steps - 1, 0))]
             step_count = 0
 
             for batch_idx, batch in enumerate(loader, start=1):

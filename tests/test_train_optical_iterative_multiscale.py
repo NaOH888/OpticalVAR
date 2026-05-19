@@ -194,7 +194,7 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             self.assertIn("final_loss", payload)
             self.assertIn("scale_loss", payload)
             self.assertIn("scale_losses", payload)
-            self.assertEqual(len(payload["scale_losses"]), 3)
+            self.assertEqual(len(payload["scale_losses"]), 2)
             self.assertIn("band_loss", payload)
             self.assertIn("tv_loss", payload)
             self.assertIn("background_loss", payload)
@@ -288,7 +288,7 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
         criterion = IterativeStepLoss(
             num_steps=3,
             loss_type="l1",
-            step_weights=[4.0, 2.0, 1.0],
+            step_weights=[4.0, 2.0],
             perceptual_weight=0.0,
             state_normalization="mean_power",
         )
@@ -323,12 +323,11 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
         output = criterion(predictions=predictions, batch=batch)
 
         scale_losses = output["scale_losses"]
-        self.assertEqual(len(scale_losses), 3)
+        self.assertEqual(len(scale_losses), 2)
         expected_weighted = (
             4.0 * float(scale_losses[0].detach().cpu())
             + 2.0 * float(scale_losses[1].detach().cpu())
-            + 1.0 * float(scale_losses[2].detach().cpu())
-        ) / 7.0
+        ) / 6.0
         self.assertAlmostEqual(float(output["scale_loss"].detach().cpu()), expected_weighted, places=6)
 
     def test_iterative_step_loss_keeps_perceptual_out_of_scale_and_final(self) -> None:
@@ -339,7 +338,7 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
         criterion = IterativeStepLoss(
             num_steps=2,
             loss_type="l1",
-            step_weights=[1.0, 1.0],
+            step_weights=[1.0],
             perceptual_weight=0.5,
             perceptual_loss_fn=ConstantPerceptual(),
             state_normalization="mean_power",
@@ -356,21 +355,70 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
         output = criterion(predictions=predictions, batch=batch)
 
         step_losses = output["scale_losses"]
-        expected_scale = 0.5 * (
-            float(step_losses[0].detach().cpu()) + float(step_losses[1].detach().cpu())
-        )
+        expected_scale = float(step_losses[0].detach().cpu())
         self.assertAlmostEqual(float(output["scale_loss"].detach().cpu()), expected_scale, places=6)
         self.assertAlmostEqual(
             float(output["final_loss"].detach().cpu()),
-            float(step_losses[-1].detach().cpu()),
+            float(criterion._scale_aligned_loss(predictions[-1], batch["target_scale_2"]).detach().cpu()),
             places=6,
         )
         self.assertAlmostEqual(float(output["perceptual_loss"].detach().cpu()), 2.0, places=6)
         self.assertAlmostEqual(
             float(output["total_loss"].detach().cpu()),
-            expected_scale + 1.0,
+            expected_scale + float(output["final_loss"].detach().cpu()) + 1.0,
             places=6,
         )
+
+    def test_iterative_step_loss_supports_all_step_latent_div_weights(self) -> None:
+        criterion = IterativeStepLoss(
+            num_steps=3,
+            loss_type="l1",
+            step_weights=[1.0, 1.0],
+            latent_diversity_weight=1.0,
+            latent_diversity_margin=0.1,
+            latent_div_step_weights=[1.0, 2.0, 4.0],
+            state_normalization="mean_power",
+        )
+        predictions = (
+            torch.tensor(
+                [[[[1.0, 0.0], [0.0, 0.0]]], [[[0.0, 1.0], [0.0, 0.0]]]],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [[[[1.0, 1.0], [0.0, 0.0]]], [[[0.0, 0.0], [1.0, 0.0]]]],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [[[[1.0, 1.0], [1.0, 0.0]]], [[[0.0, 0.0], [1.0, 1.0]]]],
+                dtype=torch.float32,
+            ),
+        )
+        batch = {
+            "target_scale_1": torch.zeros((2, 1, 2, 2), dtype=torch.float32),
+            "target_scale_2": torch.zeros((2, 1, 2, 2), dtype=torch.float32),
+            "target_scale_3": torch.zeros((2, 1, 2, 2), dtype=torch.float32),
+        }
+        latent_input = torch.tensor(
+            [
+                [[[1.0, 0.0], [0.0, 0.0]]],
+                [[[0.0, 1.0], [0.0, 0.0]]],
+            ],
+            dtype=torch.float32,
+        )
+
+        output = criterion(predictions=predictions, batch=batch, latent_input=latent_input)
+
+        per_step = [
+            float(
+                criterion._latent_diversity_loss(
+                    prediction=prediction,
+                    latent_input=latent_input,
+                ).detach().cpu()
+            )
+            for prediction in predictions
+        ]
+        expected = (1.0 * per_step[0] + 2.0 * per_step[1] + 4.0 * per_step[2]) / 7.0
+        self.assertAlmostEqual(float(output["latent_diversity_loss"].detach().cpu()), expected, places=6)
 
 
 if __name__ == "__main__":
