@@ -269,6 +269,21 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             history_lines = (outputs_dir / "history.jsonl").read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(history_lines), 2)
 
+    def test_train_supports_split_encoder_decoder_learning_rates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path, outputs_dir = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["training"]["lr"] = 1.0e-3
+            config["training"]["encoder_lr"] = 2.0e-4
+            config["training"]["decoder_lr"] = 8.0e-4
+
+            result = train(config, config_path=config_path)
+
+            self.assertTrue((outputs_dir / "latest.pt").exists())
+            self.assertEqual(result["metrics"]["optimizer_lrs"]["encoder"], 2.0e-4)
+            self.assertEqual(result["metrics"]["optimizer_lrs"]["decoder"], 8.0e-4)
+
     def test_iterative_step_loss_supports_step_weights(self) -> None:
         criterion = IterativeStepLoss(
             num_steps=3,

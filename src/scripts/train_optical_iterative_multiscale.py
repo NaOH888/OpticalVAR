@@ -448,9 +448,26 @@ def _build_loss(config: dict[str, Any], *, device: torch.device, num_steps: int)
 
 def _build_optimizer(model: IterativeMultiscaleOpticalModel, *, train_cfg: dict[str, Any]) -> torch.optim.Optimizer:
     lr = float(train_cfg.get("lr", 1.0e-3))
+    encoder_lr = float(train_cfg.get("encoder_lr", lr))
+    decoder_lr = float(train_cfg.get("decoder_lr", lr))
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
+    param_groups = [
+        {
+            "params": [param for param in model.encoder.parameters() if param.requires_grad],
+            "lr": encoder_lr,
+            "group_name": "encoder",
+        },
+        {
+            "params": [param for param in model.decoder.parameters() if param.requires_grad],
+            "lr": decoder_lr,
+            "group_name": "decoder",
+        },
+    ]
+    if not any(group["params"] for group in param_groups):
+        raise ValueError("No trainable parameters found after applying freeze settings")
+    param_groups = [group for group in param_groups if group["params"]]
     return torch.optim.Adam(
-        [param for param in model.parameters() if param.requires_grad],
+        param_groups,
         lr=lr,
         weight_decay=weight_decay,
     )
