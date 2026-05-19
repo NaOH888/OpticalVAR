@@ -34,6 +34,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         prev_image_channels: Sequence[int] | None = None,
         use_prev_image: bool = True,
         fusion_hidden_dim: int = 128,
+        dropout_prob: float = 0.0,
         weight_init: str = "kaiming_uniform",
         output_weight_init: str = "xavier_uniform",
         upsample_mode: str = "bilinear",
@@ -50,6 +51,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         self.condition_embed_dim = None if condition_embed_dim is None else int(condition_embed_dim)
         self.use_prev_image = bool(use_prev_image)
         self.fusion_hidden_dim = int(fusion_hidden_dim)
+        self.dropout_prob = float(dropout_prob)
         self.weight_init = str(weight_init)
         self.output_weight_init = str(output_weight_init)
         self.upsample_mode = str(upsample_mode)
@@ -64,6 +66,8 @@ class IterativeMultiscaleEncoder(nn.Module):
             raise ValueError("num_steps must be positive")
         if self.step_embedding_dim <= 0:
             raise ValueError("step_embedding_dim must be positive")
+        if not (0.0 <= self.dropout_prob < 1.0):
+            raise ValueError(f"dropout_prob must be in [0, 1), got {self.dropout_prob!r}")
         if self.condition_layer is None and self.condition_embed_dim is not None:
             raise ValueError("condition_embed_dim must be omitted when condition_layer is disabled")
         if self.condition_layer is not None and (self.condition_embed_dim is None or self.condition_embed_dim <= 0):
@@ -121,6 +125,7 @@ class IterativeMultiscaleEncoder(nn.Module):
                 for index in range(len(self.stage_sizes))
             ]
         )
+        self.shared_dropout = nn.Dropout2d(p=self.dropout_prob) if self.dropout_prob > 0.0 else nn.Identity()
         self.init_head = nn.Conv2d(self.latent_stage_channels[-1], 1, kernel_size=1, bias=True)
 
         if self.use_prev_image:
@@ -146,11 +151,13 @@ class IterativeMultiscaleEncoder(nn.Module):
                 out_channels=self.latent_stage_channels[-1],
                 condition_dim=self.fusion_hidden_dim,
             )
+            self.refine_dropout = nn.Dropout2d(p=self.dropout_prob) if self.dropout_prob > 0.0 else nn.Identity()
         else:
             self.prev_stem = None
             self.prev_blocks = None
             self.prev_projector = None
             self.refine_block = None
+            self.refine_dropout = None
         self.refine_head = nn.Conv2d(self.latent_stage_channels[-1], 1, kernel_size=1, bias=True)
         self._reset_parameters()
 
@@ -259,6 +266,7 @@ class IterativeMultiscaleEncoder(nn.Module):
             hidden = _interpolate_like(hidden, size=target_size, mode=self.upsample_mode)
             hidden = self.stage_projectors[index](hidden)
             hidden = block(hidden, conditioning_repr)
+            hidden = self.shared_dropout(hidden)
         return hidden
 
     def _encode_prev_image(self, prev_image: torch.Tensor) -> torch.Tensor:
@@ -307,6 +315,8 @@ class IterativeMultiscaleEncoder(nn.Module):
             raise RuntimeError("refine_block must be initialized when use_prev_image is enabled")
         prev_features = self._encode_prev_image(prev_image)
         refined_features = self.refine_block(shared_features + prev_features, conditioning_repr)
+        if self.refine_dropout is not None:
+            refined_features = self.refine_dropout(refined_features)
         return self.refine_head(refined_features)
 
     def forward(

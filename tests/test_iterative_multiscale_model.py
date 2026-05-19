@@ -197,6 +197,30 @@ class IterativeMultiscaleModelTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(output_a, output_b))
 
+    def test_iterative_encoder_supports_dropout(self) -> None:
+        encoder = IterativeMultiscaleEncoder(
+            latent_channels=4,
+            latent_height=2,
+            latent_width=2,
+            output_height=8,
+            output_width=8,
+            num_steps=4,
+            step_embedding_dim=8,
+            latent_stage_channels=(24, 16, 12),
+            prev_image_channels=(12, 8),
+            use_prev_image=True,
+            fusion_hidden_dim=16,
+            dropout_prob=0.1,
+        )
+        encoder.train()
+        latent = torch.rand((2, 4, 2, 2), dtype=torch.float32)
+        prev = torch.rand((2, 1, 8, 8), dtype=torch.float32)
+
+        output = encoder(prev_image=prev, latent=latent, timesteps=1)
+
+        self.assertEqual(tuple(output.shape), (2, 1, 8, 8))
+        self.assertTrue(torch.isfinite(output).all().item())
+
 
 if __name__ == "__main__":
     unittest.main()

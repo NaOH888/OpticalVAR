@@ -398,6 +398,7 @@ def _build_model(config: dict[str, Any], *, sample_item: dict[str, Any]) -> Iter
         prev_image_channels=encoder_cfg.get("prev_image_channels"),
         use_prev_image=bool(iterative_cfg.get("use_prev_image", True)),
         fusion_hidden_dim=int(encoder_cfg.get("fusion_hidden_dim", 128)),
+        dropout_prob=float(encoder_cfg.get("dropout_prob", 0.0)),
         weight_init=str(encoder_cfg.get("weight_init", "kaiming_uniform")),
         output_weight_init=str(encoder_cfg.get("output_weight_init", "xavier_uniform")),
         upsample_mode=str(encoder_cfg.get("upsample_mode", "bilinear")),
