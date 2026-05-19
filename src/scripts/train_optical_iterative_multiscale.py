@@ -51,6 +51,8 @@ class IterativeStepLoss(nn.Module):
         latent_diversity_weight: float = 0.0,
         latent_diversity_margin: float = 0.05,
         latent_div_step_weights: list[float] | tuple[float, ...] | None = None,
+        condition_corr_weight: float = 0.0,
+        condition_corr_step_weights: list[float] | tuple[float, ...] | None = None,
         state_normalization: str = "mean_power",
     ) -> None:
         super().__init__()
@@ -67,10 +69,15 @@ class IterativeStepLoss(nn.Module):
         self.perceptual_loss_fn = perceptual_loss_fn
         self.latent_diversity_weight = float(latent_diversity_weight)
         self.latent_diversity_margin = float(latent_diversity_margin)
+        self.condition_corr_weight = float(condition_corr_weight)
         if latent_div_step_weights is None:
             self.latent_div_step_weights = tuple(1.0 for _ in range(self.num_steps))
         else:
             self.latent_div_step_weights = tuple(float(value) for value in latent_div_step_weights)
+        if condition_corr_step_weights is None:
+            self.condition_corr_step_weights = tuple(1.0 for _ in range(self.num_steps))
+        else:
+            self.condition_corr_step_weights = tuple(float(value) for value in condition_corr_step_weights)
         self.state_normalization = str(state_normalization)
         if self.num_steps <= 0:
             raise ValueError("num_steps must be positive")
@@ -92,10 +99,23 @@ class IterativeStepLoss(nn.Module):
                 f"latent_div_step_weights length must equal num_steps={self.num_steps}, "
                 f"got {len(self.latent_div_step_weights)}"
             )
-        if any(value <= 0.0 for value in self.latent_div_step_weights):
-            raise ValueError("latent_div_step_weights must all be positive")
+        if any(value < 0.0 for value in self.latent_div_step_weights) or not any(
+            value > 0.0 for value in self.latent_div_step_weights
+        ):
+            raise ValueError("latent_div_step_weights must be non-negative and contain at least one positive value")
+        if len(self.condition_corr_step_weights) != self.num_steps:
+            raise ValueError(
+                f"condition_corr_step_weights length must equal num_steps={self.num_steps}, "
+                f"got {len(self.condition_corr_step_weights)}"
+            )
+        if any(value < 0.0 for value in self.condition_corr_step_weights) or not any(
+            value > 0.0 for value in self.condition_corr_step_weights
+        ):
+            raise ValueError("condition_corr_step_weights must be non-negative and contain at least one positive value")
         if self.perceptual_weight != 0.0 and self.perceptual_loss_fn is None:
             raise ValueError("perceptual_loss_fn must be provided when perceptual_weight is non-zero")
+        if self.condition_corr_weight != 0.0 and self.perceptual_loss_fn is None:
+            raise ValueError("perceptual_loss_fn must be provided when condition_corr_weight is non-zero")
         if self.state_normalization != "mean_power":
             raise ValueError(
                 "state_normalization must be 'mean_power' for the first implementation, "
@@ -172,18 +192,66 @@ class IterativeStepLoss(nn.Module):
             return prediction.new_zeros(())
         return torch.mean(pairwise_penalty[upper_mask])
 
+    @staticmethod
+    def _pairwise_mean_abs_distance(values: torch.Tensor) -> torch.Tensor:
+        if values.dim() != 2:
+            raise ValueError(f"values must be [B,D], got {tuple(values.shape)}")
+        return torch.mean(torch.abs(values.unsqueeze(1) - values.unsqueeze(0)), dim=-1)
+
+    @staticmethod
+    def _upper_triangle_values(matrix: torch.Tensor) -> torch.Tensor:
+        batch_size = int(matrix.shape[0])
+        mask = torch.triu(
+            torch.ones((batch_size, batch_size), device=matrix.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        return matrix[mask]
+
+    def _extract_perceptual_feature_vector(self, prediction: torch.Tensor) -> torch.Tensor:
+        if self.perceptual_loss_fn is None or not hasattr(self.perceptual_loss_fn, "extract_features"):
+            raise RuntimeError("perceptual_loss_fn with extract_features() is required for condition correlation loss")
+        feature_maps = self.perceptual_loss_fn.extract_features(prediction)
+        pooled = [feature_map.mean(dim=(-2, -1)) for feature_map in feature_maps]
+        return torch.cat(pooled, dim=1)
+
+    def _condition_correlation_loss(
+        self,
+        *,
+        prediction: torch.Tensor,
+        condition_input: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = int(prediction.shape[0])
+        if batch_size < 3:
+            return prediction.new_zeros(())
+        condition_features = condition_input.reshape(batch_size, -1).to(dtype=torch.float32, device=prediction.device)
+        condition_pairwise = self._pairwise_mean_abs_distance(condition_features)
+        prediction_features = self._extract_perceptual_feature_vector(prediction)
+        prediction_pairwise = self._pairwise_mean_abs_distance(prediction_features.to(dtype=torch.float32))
+        condition_values = self._upper_triangle_values(condition_pairwise)
+        prediction_values = self._upper_triangle_values(prediction_pairwise)
+        if condition_values.numel() < 2:
+            return prediction.new_zeros(())
+        condition_values = condition_values - condition_values.mean()
+        prediction_values = prediction_values - prediction_values.mean()
+        condition_norm = torch.linalg.norm(condition_values).clamp_min(1.0e-8)
+        prediction_norm = torch.linalg.norm(prediction_values).clamp_min(1.0e-8)
+        correlation = torch.sum(condition_values * prediction_values) / (condition_norm * prediction_norm)
+        return 1.0 - correlation.clamp(-1.0, 1.0)
+
     def forward(
         self,
         *,
         predictions: tuple[torch.Tensor, ...],
         batch: dict[str, Any],
         latent_input: torch.Tensor | None = None,
+        condition_input: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | tuple[torch.Tensor, ...]]:
         if len(predictions) != self.num_steps:
             raise ValueError(f"expected {self.num_steps} predictions, got {len(predictions)}")
         step_losses: list[torch.Tensor] = []
         step_perceptual_losses: list[torch.Tensor] = []
         step_latent_div_losses: list[torch.Tensor] = []
+        step_condition_corr_losses: list[torch.Tensor] = []
         for index, prediction in enumerate(predictions, start=1):
             target_key = f"target_scale_{index}"
             if target_key not in batch:
@@ -212,6 +280,17 @@ class IterativeStepLoss(nn.Module):
                 )
             else:
                 step_latent_div_losses.append(base_loss.new_zeros(()))
+            if self.condition_corr_weight != 0.0:
+                if condition_input is None:
+                    raise ValueError("condition_input must be provided when condition_corr_weight is non-zero")
+                step_condition_corr_losses.append(
+                    self._condition_correlation_loss(
+                        prediction=prediction,
+                        condition_input=condition_input,
+                    )
+                )
+            else:
+                step_condition_corr_losses.append(base_loss.new_zeros(()))
         if not step_losses:
             raise RuntimeError("step loss list must not be empty")
         scale_step_losses = tuple(step_losses[:-1])
@@ -227,6 +306,10 @@ class IterativeStepLoss(nn.Module):
         latent_diversity_loss = sum(
             weight * loss for weight, loss in zip(self.latent_div_step_weights, step_latent_div_losses)
         ) / latent_div_weight_sum
+        condition_corr_weight_sum = float(sum(self.condition_corr_step_weights))
+        condition_correlation_loss = sum(
+            weight * loss for weight, loss in zip(self.condition_corr_step_weights, step_condition_corr_losses)
+        ) / condition_corr_weight_sum
         final_loss = step_losses[-1]
         final_perceptual = step_perceptual_losses[-1] if step_perceptual_losses else final_loss.new_zeros(())
         return {
@@ -235,6 +318,7 @@ class IterativeStepLoss(nn.Module):
                 + self.final_weight * final_loss
                 + self.perceptual_weight * final_perceptual
                 + self.latent_diversity_weight * latent_diversity_loss
+                + self.condition_corr_weight * condition_correlation_loss
             ),
             "final_loss": final_loss,
             "scale_loss": scale_loss,
@@ -243,6 +327,7 @@ class IterativeStepLoss(nn.Module):
             "background_loss": scale_loss.new_zeros(()),
             "perceptual_loss": final_perceptual,
             "latent_diversity_loss": latent_diversity_loss,
+            "condition_correlation_loss": condition_correlation_loss,
             "scale_losses": scale_step_losses,
         }
 
@@ -292,15 +377,85 @@ def _build_condition_layer(config: dict[str, Any]) -> tuple[ConditionEmbeddingLa
         return None, None
     condition_embed_dim = int(encoder_cfg.get("condition_embed_dim", 128))
     resolved_mode = "class_index" if condition_mode is None else str(condition_mode)
+    condition_input_dim = encoder_cfg.get("condition_input_dim")
+    if _condition_heatmap_enabled(config) and resolved_mode == "attribute_vector":
+        condition_input_dim = int(encoder_cfg["condition_attribute_dim"])
     layer = ConditionEmbeddingLayer(
         mode=resolved_mode,
         output_dim=condition_embed_dim,
         num_classes=int(encoder_cfg.get("num_classes", 0)) if resolved_mode == "class_index" else None,
-        input_dim=encoder_cfg.get("condition_input_dim") if resolved_mode == "attribute_vector" else None,
+        input_dim=condition_input_dim if resolved_mode == "attribute_vector" else None,
         embed_dim=int(encoder_cfg.get("class_embed_dim", 128)),
         hidden_dim=encoder_cfg.get("condition_hidden_dim"),
     )
     return layer, condition_embed_dim
+
+
+def _condition_heatmap_enabled(config: dict[str, Any]) -> bool:
+    encoder_cfg = dict(config["encoder"])
+    return bool(encoder_cfg.get("use_landmark_heatmap", False))
+
+
+def _build_landmark_heatmap_batch(
+    landmarks: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+    sigma_px: float,
+) -> torch.Tensor:
+    if landmarks.dim() != 2 or int(landmarks.shape[1]) % 2 != 0:
+        raise ValueError(f"landmarks must be [B,2P], got {tuple(landmarks.shape)}")
+    batch_size = int(landmarks.shape[0])
+    num_points = int(landmarks.shape[1] // 2)
+    coords = landmarks.to(dtype=torch.float32).reshape(batch_size, num_points, 2)
+    y_coords = coords[..., 1].clamp(0.0, 1.0) * float(height - 1)
+    x_coords = coords[..., 0].clamp(0.0, 1.0) * float(width - 1)
+    grid_y = torch.arange(height, device=landmarks.device, dtype=torch.float32).view(1, 1, height, 1)
+    grid_x = torch.arange(width, device=landmarks.device, dtype=torch.float32).view(1, 1, 1, width)
+    sigma_sq = float(sigma_px) ** 2
+    return torch.exp(
+        -((grid_y - y_coords.unsqueeze(-1).unsqueeze(-1)).square() + (grid_x - x_coords.unsqueeze(-1).unsqueeze(-1)).square())
+        / max(2.0 * sigma_sq, 1.0e-8)
+    )
+
+
+def _build_condition_inputs(
+    batch: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    device: torch.device,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    encoder_cfg = dict(config["encoder"])
+    condition_mode = encoder_cfg.get("condition_mode")
+    if condition_mode is None and not bool(encoder_cfg.get("class_conditional", False)):
+        return None, None, None
+    if "label" not in batch:
+        raise KeyError("dataset batch must contain 'label' when conditioning is enabled")
+    raw_label = batch["label"]
+    if condition_mode != "attribute_vector":
+        class_labels = raw_label.to(device=device, dtype=torch.long).reshape(-1)
+        return class_labels, None, None
+
+    condition_vector = raw_label.to(device=device, dtype=torch.float32)
+    condition_heatmap: torch.Tensor | None = None
+    if _condition_heatmap_enabled(config):
+        attr_dim = int(encoder_cfg["condition_attribute_dim"])
+        landmark_dim = int(encoder_cfg["condition_landmark_dim"])
+        if landmark_dim <= 0 or landmark_dim % 2 != 0:
+            raise ValueError("condition_landmark_dim must be a positive even integer when use_landmark_heatmap is enabled")
+        if int(condition_vector.shape[1]) < attr_dim + landmark_dim:
+            raise ValueError(
+                "attribute_vector condition does not contain enough values for "
+                f"condition_attribute_dim={attr_dim} and condition_landmark_dim={landmark_dim}"
+            )
+        condition_heatmap = _build_landmark_heatmap_batch(
+            condition_vector[:, attr_dim : attr_dim + landmark_dim],
+            height=int(encoder_cfg.get("output_height")),
+            width=int(encoder_cfg.get("output_width")),
+            sigma_px=float(encoder_cfg.get("landmark_heatmap_sigma_px", 4.0)),
+        )
+        condition_vector = condition_vector[:, :attr_dim]
+    return condition_vector, condition_heatmap, raw_label.to(device=device, dtype=torch.float32)
 
 
 def _build_optical_decoder(config: dict[str, Any]) -> OpticalPrefixReadoutDecoder:
@@ -418,6 +573,11 @@ def _build_model(config: dict[str, Any], *, sample_item: dict[str, Any]) -> Iter
 
     iterative_cfg = dict(config["iterative"])
     encoder_cfg = dict(config["encoder"])
+    condition_heatmap_channels = 0
+    if _condition_heatmap_enabled(config):
+        if str(encoder_cfg.get("condition_mode")) != "attribute_vector":
+            raise ValueError("use_landmark_heatmap requires encoder.condition_mode='attribute_vector'")
+        condition_heatmap_channels = int(encoder_cfg["condition_landmark_dim"]) // 2
     condition_layer, condition_embed_dim = _build_condition_layer(config)
     encoder = IterativeMultiscaleEncoder(
         latent_channels=int(latent.shape[0]),
@@ -429,6 +589,7 @@ def _build_model(config: dict[str, Any], *, sample_item: dict[str, Any]) -> Iter
         step_embedding_dim=int(iterative_cfg["step_embedding_dim"]),
         condition_layer=condition_layer,
         condition_embed_dim=condition_embed_dim,
+        condition_heatmap_channels=condition_heatmap_channels,
         latent_stage_channels=encoder_cfg.get("latent_channels"),
         prev_image_channels=encoder_cfg.get("prev_image_channels"),
         use_prev_image=bool(iterative_cfg.get("use_prev_image", True)),
@@ -447,15 +608,8 @@ def _build_model(config: dict[str, Any], *, sample_item: dict[str, Any]) -> Iter
 
 
 def _build_condition_batch(batch: dict[str, Any], *, config: dict[str, Any], device: torch.device) -> torch.Tensor | None:
-    encoder_cfg = dict(config["encoder"])
-    condition_mode = encoder_cfg.get("condition_mode")
-    if condition_mode is None and not bool(encoder_cfg.get("class_conditional", False)):
-        return None
-    if "label" not in batch:
-        raise KeyError("dataset batch must contain 'label' when conditioning is enabled")
-    if condition_mode == "attribute_vector":
-        return batch["label"].to(device=device, dtype=torch.float32)
-    return batch["label"].to(device=device, dtype=torch.long).reshape(-1)
+    condition_vector, _, _ = _build_condition_inputs(batch, config=config, device=device)
+    return condition_vector
 
 
 def _build_loss(config: dict[str, Any], *, device: torch.device, num_steps: int) -> IterativeStepLoss:
@@ -481,6 +635,8 @@ def _build_loss(config: dict[str, Any], *, device: torch.device, num_steps: int)
         latent_diversity_weight=float(loss_cfg.get("latent_diversity_weight", 0.0)),
         latent_diversity_margin=float(loss_cfg.get("latent_diversity_margin", 0.05)),
         latent_div_step_weights=loss_cfg.get("latent_div_step_weights"),
+        condition_corr_weight=float(loss_cfg.get("condition_corr_weight", 0.0)),
+        condition_corr_step_weights=loss_cfg.get("condition_corr_step_weights"),
         state_normalization=str(iterative_cfg.get("state_normalization", "mean_power")),
     )
 
@@ -631,21 +787,32 @@ def train(
             running_background = 0.0
             running_latent_div = 0.0
             running_perceptual = 0.0
+            running_condition_corr = 0.0
             running_scale_steps = [0.0 for _ in range(max(num_steps - 1, 0))]
             step_count = 0
 
             for batch_idx, batch in enumerate(loader, start=1):
                 batch = _move_batch_to_device(batch, device)
                 latent = batch["latent"].to(device=device, dtype=torch.float32)
-                condition = _build_condition_batch(batch, config=config, device=device)
+                condition, condition_heatmap, condition_signal = _build_condition_inputs(
+                    batch,
+                    config=config,
+                    device=device,
+                )
                 trajectory = model(
                     latent=latent,
                     condition=condition if config["encoder"].get("condition_mode") == "attribute_vector" else None,
                     class_labels=condition if config["encoder"].get("condition_mode") != "attribute_vector" else None,
+                    condition_heatmap=condition_heatmap,
                     num_steps=num_steps,
                     detach_prev_state=bool(iterative_cfg.get("detach_prev_state", False)),
                 )
-                loss_output = criterion(predictions=trajectory["predictions"], batch=batch, latent_input=latent)
+                loss_output = criterion(
+                    predictions=trajectory["predictions"],
+                    batch=batch,
+                    latent_input=latent,
+                    condition_input=condition_signal,
+                )
                 total_loss = loss_output["total_loss"]
 
                 optimizer.zero_grad(set_to_none=True)
@@ -663,6 +830,7 @@ def train(
                 running_perceptual += float(loss_output["perceptual_loss"].detach().cpu())
                 latent_div_value = float(loss_output["latent_diversity_loss"].detach().cpu())
                 running_latent_div += latent_div_value
+                running_condition_corr += float(loss_output["condition_correlation_loss"].detach().cpu())
                 step_losses = loss_output["scale_losses"]
                 for step_index, step_loss in enumerate(step_losses):
                     running_scale_steps[step_index] += float(step_loss.detach().cpu())
@@ -680,6 +848,7 @@ def train(
                         f"bg={running_background / step_count:.6f} "
                         f"perc={running_perceptual / step_count:.6f} "
                         f"latent_div={running_latent_div / step_count:.6f} "
+                        f"cond_corr={running_condition_corr / step_count:.6f} "
                         f"scale_losses={avg_scale_steps} "
                     )
 
@@ -700,6 +869,7 @@ def train(
                 "background_loss": running_background / step_count,
                 "perceptual_loss": running_perceptual / step_count,
                 "latent_diversity_loss": running_latent_div / step_count,
+                "condition_correlation_loss": running_condition_corr / step_count,
                 "optimizer_lrs": optimizer_group_lrs,
             }
             print(
@@ -712,6 +882,7 @@ def train(
                 f"bg={latest_metrics['background_loss']:.6f} "
                 f"perc={latest_metrics['perceptual_loss']:.6f} "
                 f"latent_div={latest_metrics['latent_diversity_loss']:.6f} "
+                f"cond_corr={latest_metrics['condition_correlation_loss']:.6f} "
                 f"lrs={latest_metrics['optimizer_lrs']}"
             )
             _append_jsonl(history_path, latest_metrics)

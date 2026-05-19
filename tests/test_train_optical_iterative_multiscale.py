@@ -200,6 +200,7 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             self.assertIn("background_loss", payload)
             self.assertIn("perceptual_loss", payload)
             self.assertIn("latent_diversity_loss", payload)
+            self.assertIn("condition_correlation_loss", payload)
             self.assertIn("optimizer_lrs", payload)
 
     def test_train_requires_num_steps_match_num_levels(self) -> None:
@@ -231,6 +232,21 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             config_path, outputs_dir = self._write_tiny_training_case(tmp_path)
             config = json.loads(config_path.read_text(encoding="utf-8"))
             config["iterative"]["use_prev_image"] = False
+
+            result = train(config, config_path=config_path)
+
+            self.assertTrue((outputs_dir / "latest.pt").exists())
+            self.assertIn("metrics", result)
+
+    def test_train_supports_landmark_heatmap_condition_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path, outputs_dir = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["encoder"]["use_landmark_heatmap"] = True
+            config["encoder"]["condition_attribute_dim"] = 4
+            config["encoder"]["condition_landmark_dim"] = 2
+            config["encoder"]["landmark_heatmap_sigma_px"] = 2.0
 
             result = train(config, config_path=config_path)
 
@@ -419,6 +435,60 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
         ]
         expected = (1.0 * per_step[0] + 2.0 * per_step[1] + 4.0 * per_step[2]) / 7.0
         self.assertAlmostEqual(float(output["latent_diversity_loss"].detach().cpu()), expected, places=6)
+
+    def test_iterative_step_loss_supports_condition_correlation_loss(self) -> None:
+        class TinyPerceptual(torch.nn.Module):
+            def extract_features(self, image: torch.Tensor) -> list[torch.Tensor]:
+                return [image]
+
+            def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+                return torch.mean(torch.abs(prediction - target))
+
+        criterion = IterativeStepLoss(
+            num_steps=2,
+            loss_type="l1",
+            step_weights=[1.0],
+            perceptual_weight=0.0,
+            perceptual_loss_fn=TinyPerceptual(),
+            condition_corr_weight=1.0,
+            condition_corr_step_weights=[1.0, 2.0],
+            state_normalization="mean_power",
+        )
+        predictions = (
+            torch.tensor(
+                [
+                    [[[0.0, 0.0], [0.0, 0.0]]],
+                    [[[1.0, 0.0], [0.0, 0.0]]],
+                    [[[2.0, 0.0], [0.0, 0.0]]],
+                ],
+                dtype=torch.float32,
+            ),
+            torch.tensor(
+                [
+                    [[[0.0, 0.0], [0.0, 0.0]]],
+                    [[[0.5, 0.0], [0.0, 0.0]]],
+                    [[[1.0, 0.0], [0.0, 0.0]]],
+                ],
+                dtype=torch.float32,
+            ),
+        )
+        batch = {
+            "target_scale_1": torch.zeros((3, 1, 2, 2), dtype=torch.float32),
+            "target_scale_2": torch.zeros((3, 1, 2, 2), dtype=torch.float32),
+        }
+        condition_input = torch.tensor(
+            [
+                [0.0, 0.0],
+                [0.5, 0.0],
+                [1.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+
+        output = criterion(predictions=predictions, batch=batch, condition_input=condition_input)
+
+        self.assertGreaterEqual(float(output["condition_correlation_loss"].detach().cpu()), 0.0)
+        self.assertIn("condition_correlation_loss", output)
 
 
 if __name__ == "__main__":

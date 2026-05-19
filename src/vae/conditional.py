@@ -147,27 +147,28 @@ class PerceptualLoss(nn.Module):
         for parameter in self.features.parameters():
             parameter.requires_grad_(False)
 
-    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if prediction.shape[1] == 1:
-            prediction = prediction.repeat(1, 3, 1, 1)
-        if target.shape[1] == 1:
-            target = target.repeat(1, 3, 1, 1)
+    def extract_features(self, image: torch.Tensor) -> list[torch.Tensor]:
+        if image.shape[1] == 1:
+            image = image.repeat(1, 3, 1, 1)
 
-        prediction = (prediction - self.mean.to(device=prediction.device, dtype=prediction.dtype)) / self.std.to(
-            device=prediction.device, dtype=prediction.dtype
-        )
-        target = (target - self.mean.to(device=target.device, dtype=target.dtype)) / self.std.to(
-            device=target.device, dtype=target.dtype
+        image = (image - self.mean.to(device=image.device, dtype=image.dtype)) / self.std.to(
+            device=image.device, dtype=image.dtype
         )
 
-        loss = prediction.new_zeros(())
-        prediction_features = prediction
-        target_features = target
+        collected: list[torch.Tensor] = []
+        features = image
         for layer_idx, layer in enumerate(self.features):
-            prediction_features = layer(prediction_features)
-            target_features = layer(target_features)
+            features = layer(features)
             if layer_idx in self.feature_layers:
-                loss = loss + F.l1_loss(prediction_features, target_features, reduction="mean")
+                collected.append(features)
+        return collected
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        loss = prediction.new_zeros(())
+        prediction_features = self.extract_features(prediction)
+        target_features = self.extract_features(target)
+        for prediction_feature, target_feature in zip(prediction_features, target_features):
+            loss = loss + F.l1_loss(prediction_feature, target_feature, reduction="mean")
         return loss
 
 

@@ -16,7 +16,7 @@ if __package__ in {None, ""}:
     if str(SRC_ROOT) not in sys.path:
         sys.path.insert(0, str(SRC_ROOT))
 
-from scripts.train_optical_iterative_multiscale import _build_condition_batch, _build_dataset_and_loader, _build_model
+from scripts.train_optical_iterative_multiscale import _build_condition_inputs, _build_dataset_and_loader, _build_model
 
 
 def _load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
@@ -110,12 +110,18 @@ def _summarize_label(label: torch.Tensor) -> int | list[float]:
     return label_cpu.reshape(-1).tolist()
 
 
-def _build_condition_from_sample(sample: dict[str, Any], *, config: dict[str, Any], device: torch.device) -> torch.Tensor | None:
+def _build_condition_from_sample(
+    sample: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    device: torch.device,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if "label" not in sample:
-        return None
+        return None, None
     label = sample["label"] if isinstance(sample["label"], torch.Tensor) else torch.as_tensor(sample["label"])
     batch = {"label": label.unsqueeze(0).to(device)}
-    return _build_condition_batch(batch, config=config, device=device)
+    condition, condition_heatmap, _ = _build_condition_inputs(batch, config=config, device=device)
+    return condition, condition_heatmap
 
 
 def _run_model(
@@ -123,6 +129,7 @@ def _run_model(
     *,
     latent: torch.Tensor,
     condition: torch.Tensor | None,
+    condition_heatmap: torch.Tensor | None,
     condition_mode: str | None,
     num_steps: int,
     detach_prev_state: bool,
@@ -132,6 +139,7 @@ def _run_model(
             latent=latent,
             condition=condition if condition_mode == "attribute_vector" else None,
             class_labels=condition if condition_mode != "attribute_vector" else None,
+            condition_heatmap=condition_heatmap,
             num_steps=num_steps,
             detach_prev_state=detach_prev_state,
         )
@@ -205,11 +213,12 @@ def main(argv: list[str] | None = None) -> None:
         condition_mode = config["encoder"].get("condition_mode")
 
         anchor_latent = anchor_sample["latent"].unsqueeze(0).to(device=device, dtype=torch.float32)
-        anchor_condition = _build_condition_from_sample(anchor_sample, config=config, device=device)
+        anchor_condition, anchor_condition_heatmap = _build_condition_from_sample(anchor_sample, config=config, device=device)
         anchor_outputs = _run_model(
             model,
             latent=anchor_latent,
             condition=anchor_condition,
+            condition_heatmap=anchor_condition_heatmap,
             condition_mode=condition_mode,
             num_steps=num_steps,
             detach_prev_state=detach_prev_state,
@@ -226,12 +235,13 @@ def main(argv: list[str] | None = None) -> None:
 
         for sample_index, sample in zip(candidate_indices, candidate_samples):
             sample_latent = sample["latent"].unsqueeze(0).to(device=device, dtype=torch.float32)
-            sample_condition = _build_condition_from_sample(sample, config=config, device=device)
+            sample_condition, sample_condition_heatmap = _build_condition_from_sample(sample, config=config, device=device)
 
             latent_outputs = _run_model(
                 model,
                 latent=sample_latent,
                 condition=anchor_condition,
+                condition_heatmap=anchor_condition_heatmap,
                 condition_mode=condition_mode,
                 num_steps=num_steps,
                 detach_prev_state=detach_prev_state,
@@ -258,6 +268,7 @@ def main(argv: list[str] | None = None) -> None:
                 model,
                 latent=anchor_latent,
                 condition=sample_condition,
+                condition_heatmap=sample_condition_heatmap,
                 condition_mode=condition_mode,
                 num_steps=num_steps,
                 detach_prev_state=detach_prev_state,

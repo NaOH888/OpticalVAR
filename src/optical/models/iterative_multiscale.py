@@ -30,6 +30,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         step_embedding_dim: int,
         condition_layer: ConditionEmbeddingLayer | None = None,
         condition_embed_dim: int | None = None,
+        condition_heatmap_channels: int = 0,
         latent_stage_channels: Sequence[int] | None = None,
         prev_image_channels: Sequence[int] | None = None,
         use_prev_image: bool = True,
@@ -49,6 +50,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         self.step_embedding_dim = int(step_embedding_dim)
         self.condition_layer = condition_layer
         self.condition_embed_dim = None if condition_embed_dim is None else int(condition_embed_dim)
+        self.condition_heatmap_channels = int(condition_heatmap_channels)
         self.use_prev_image = bool(use_prev_image)
         self.fusion_hidden_dim = int(fusion_hidden_dim)
         self.dropout_prob = float(dropout_prob)
@@ -72,6 +74,8 @@ class IterativeMultiscaleEncoder(nn.Module):
             raise ValueError("condition_embed_dim must be omitted when condition_layer is disabled")
         if self.condition_layer is not None and (self.condition_embed_dim is None or self.condition_embed_dim <= 0):
             raise ValueError("condition_embed_dim must be positive when conditioning is enabled")
+        if self.condition_heatmap_channels < 0:
+            raise ValueError("condition_heatmap_channels must be non-negative")
 
         self.stage_sizes = _build_spatial_stage_sizes(
             input_height=self.latent_height,
@@ -126,6 +130,25 @@ class IterativeMultiscaleEncoder(nn.Module):
             ]
         )
         self.shared_dropout = nn.Dropout2d(p=self.dropout_prob) if self.dropout_prob > 0.0 else nn.Identity()
+        if self.condition_heatmap_channels > 0:
+            spatial_hidden_channels = max(16, self.latent_stage_channels[-1] // 2)
+            self.condition_heatmap_stem = nn.Conv2d(
+                self.condition_heatmap_channels,
+                spatial_hidden_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=True,
+            )
+            self.condition_heatmap_projector = nn.Conv2d(
+                spatial_hidden_channels,
+                self.latent_stage_channels[-1],
+                kernel_size=1,
+                bias=True,
+            )
+        else:
+            self.condition_heatmap_stem = None
+            self.condition_heatmap_projector = None
         self.init_head = nn.Conv2d(self.latent_stage_channels[-1], 1, kernel_size=1, bias=True)
 
         if self.use_prev_image:
@@ -174,6 +197,10 @@ class IterativeMultiscaleEncoder(nn.Module):
             _init_linear_or_conv(block.pointwise, self.weight_init)
             if block.modulation is not None:
                 _init_linear_or_conv(block.modulation.projector, self.weight_init)
+        if self.condition_heatmap_stem is not None:
+            _init_linear_or_conv(self.condition_heatmap_stem, self.weight_init)
+        if self.condition_heatmap_projector is not None:
+            _init_linear_or_conv(self.condition_heatmap_projector, self.weight_init)
         if self.prev_stem is not None:
             _init_linear_or_conv(self.prev_stem, self.weight_init)
         if self.prev_blocks is not None:
@@ -260,6 +287,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         *,
         latent_base: torch.Tensor,
         conditioning_repr: torch.Tensor,
+        condition_heatmap: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden = latent_base
         for index, (target_size, block) in enumerate(zip(self.stage_sizes, self.shared_blocks)):
@@ -267,6 +295,12 @@ class IterativeMultiscaleEncoder(nn.Module):
             hidden = self.stage_projectors[index](hidden)
             hidden = block(hidden, conditioning_repr)
             hidden = self.shared_dropout(hidden)
+        if condition_heatmap is not None:
+            if self.condition_heatmap_stem is None or self.condition_heatmap_projector is None:
+                raise RuntimeError("condition heatmap branch is not initialized")
+            spatial = self.condition_heatmap_stem(condition_heatmap.to(dtype=torch.float32))
+            spatial = _interpolate_like(spatial, size=self.stage_sizes[-1], mode=self.upsample_mode)
+            hidden = hidden + self.condition_heatmap_projector(spatial)
         return hidden
 
     def _encode_prev_image(self, prev_image: torch.Tensor) -> torch.Tensor:
@@ -292,6 +326,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         latent_base: torch.Tensor,
         timesteps: torch.Tensor | int,
         condition_base: torch.Tensor | None = None,
+        condition_heatmap: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if latent_base.dim() != 4 or int(latent_base.shape[1]) != self.latent_stage_channels[0]:
             raise ValueError(
@@ -308,6 +343,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         shared_features = self._forward_shared_features(
             latent_base=latent_base,
             conditioning_repr=conditioning_repr,
+            condition_heatmap=condition_heatmap,
         )
         if self._is_first_step(timesteps) or not self.use_prev_image:
             return self.init_head(shared_features)
@@ -327,6 +363,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         timesteps: torch.Tensor | int,
         class_labels: torch.Tensor | None = None,
         condition: torch.Tensor | None = None,
+        condition_heatmap: torch.Tensor | None = None,
     ) -> torch.Tensor:
         latent_base = self.encode_latent(latent)
         condition_base = self.encode_condition_base(
@@ -339,6 +376,7 @@ class IterativeMultiscaleEncoder(nn.Module):
             latent_base=latent_base,
             timesteps=timesteps,
             condition_base=condition_base,
+            condition_heatmap=condition_heatmap,
         )
 
 
@@ -409,6 +447,7 @@ class IterativeMultiscaleOpticalModel(nn.Module):
         step_id: torch.Tensor | int,
         class_labels: torch.Tensor | None = None,
         condition: torch.Tensor | None = None,
+        condition_heatmap: torch.Tensor | None = None,
         error_factor: float | None = None,
     ) -> dict[str, torch.Tensor]:
         prev_image = self._to_image(prev_image)
@@ -423,6 +462,7 @@ class IterativeMultiscaleOpticalModel(nn.Module):
             latent_base=latent_base,
             timesteps=step_id,
             condition_base=condition_base,
+            condition_heatmap=condition_heatmap,
         )
         prediction = self.decoder(control_map, error_factor=error_factor)["final_detector"]
         return {
@@ -437,6 +477,7 @@ class IterativeMultiscaleOpticalModel(nn.Module):
         num_steps: int,
         class_labels: torch.Tensor | None = None,
         condition: torch.Tensor | None = None,
+        condition_heatmap: torch.Tensor | None = None,
         initial_state: torch.Tensor | None = None,
         error_factor: float | None = None,
         detach_prev_state: bool = False,
@@ -466,6 +507,7 @@ class IterativeMultiscaleOpticalModel(nn.Module):
                 latent_base=latent_base,
                 timesteps=step_index,
                 condition_base=condition_base,
+                condition_heatmap=condition_heatmap,
             )
             prediction = self.decoder(control_map, error_factor=error_factor)["final_detector"]
             normalized_state = self.normalize_state(prediction)
