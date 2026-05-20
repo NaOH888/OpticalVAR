@@ -130,7 +130,7 @@ def main(argv: list[str] | None = None) -> None:
     model.eval()
 
     latent = batch["latent"].to(device=device, dtype=torch.float32)
-    condition, condition_heatmap, _ = _build_condition_inputs(batch, config=config, device=device)
+    condition, landmark_coords, _ = _build_condition_inputs(batch, config=config, device=device)
     condition_mode = config["encoder"].get("condition_mode")
     iterative_cfg = dict(config["iterative"])
     num_steps = int(iterative_cfg["num_steps"])
@@ -140,7 +140,7 @@ def main(argv: list[str] | None = None) -> None:
             latent=latent,
             condition=condition if condition_mode == "attribute_vector" else None,
             class_labels=condition if condition_mode != "attribute_vector" else None,
-            condition_heatmap=condition_heatmap,
+            landmark_coords=landmark_coords,
             num_steps=num_steps,
             detach_prev_state=bool(iterative_cfg.get("detach_prev_state", False)),
         )

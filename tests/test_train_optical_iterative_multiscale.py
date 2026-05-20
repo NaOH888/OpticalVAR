@@ -238,15 +238,17 @@ class TrainOpticalIterativeMultiscaleScriptTests(unittest.TestCase):
             self.assertTrue((outputs_dir / "latest.pt").exists())
             self.assertIn("metrics", result)
 
-    def test_train_supports_landmark_heatmap_condition_branch(self) -> None:
+    def test_train_supports_landmark_film_condition_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             config_path, outputs_dir = self._write_tiny_training_case(tmp_path)
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["encoder"]["use_landmark_heatmap"] = True
+            config["encoder"]["use_landmark_film"] = True
             config["encoder"]["condition_attribute_dim"] = 4
             config["encoder"]["condition_landmark_dim"] = 2
-            config["encoder"]["landmark_heatmap_sigma_px"] = 2.0
+            config["encoder"]["condition_input_dim"] = 4
+            config["encoder"]["landmark_fourier_bands"] = 3
+            config["encoder"]["landmark_embed_dim"] = 12
 
             result = train(config, config_path=config_path)
 

@@ -120,8 +120,8 @@ def _build_condition_from_sample(
         return None, None
     label = sample["label"] if isinstance(sample["label"], torch.Tensor) else torch.as_tensor(sample["label"])
     batch = {"label": label.unsqueeze(0).to(device)}
-    condition, condition_heatmap, _ = _build_condition_inputs(batch, config=config, device=device)
-    return condition, condition_heatmap
+    condition, landmark_coords, _ = _build_condition_inputs(batch, config=config, device=device)
+    return condition, landmark_coords
 
 
 def _run_model(
@@ -129,7 +129,7 @@ def _run_model(
     *,
     latent: torch.Tensor,
     condition: torch.Tensor | None,
-    condition_heatmap: torch.Tensor | None,
+    landmark_coords: torch.Tensor | None,
     condition_mode: str | None,
     num_steps: int,
     detach_prev_state: bool,
@@ -139,7 +139,7 @@ def _run_model(
             latent=latent,
             condition=condition if condition_mode == "attribute_vector" else None,
             class_labels=condition if condition_mode != "attribute_vector" else None,
-            condition_heatmap=condition_heatmap,
+            landmark_coords=landmark_coords,
             num_steps=num_steps,
             detach_prev_state=detach_prev_state,
         )
@@ -213,12 +213,12 @@ def main(argv: list[str] | None = None) -> None:
         condition_mode = config["encoder"].get("condition_mode")
 
         anchor_latent = anchor_sample["latent"].unsqueeze(0).to(device=device, dtype=torch.float32)
-        anchor_condition, anchor_condition_heatmap = _build_condition_from_sample(anchor_sample, config=config, device=device)
+        anchor_condition, anchor_landmark_coords = _build_condition_from_sample(anchor_sample, config=config, device=device)
         anchor_outputs = _run_model(
             model,
             latent=anchor_latent,
             condition=anchor_condition,
-            condition_heatmap=anchor_condition_heatmap,
+            landmark_coords=anchor_landmark_coords,
             condition_mode=condition_mode,
             num_steps=num_steps,
             detach_prev_state=detach_prev_state,
@@ -235,13 +235,13 @@ def main(argv: list[str] | None = None) -> None:
 
         for sample_index, sample in zip(candidate_indices, candidate_samples):
             sample_latent = sample["latent"].unsqueeze(0).to(device=device, dtype=torch.float32)
-            sample_condition, sample_condition_heatmap = _build_condition_from_sample(sample, config=config, device=device)
+            sample_condition, sample_landmark_coords = _build_condition_from_sample(sample, config=config, device=device)
 
             latent_outputs = _run_model(
                 model,
                 latent=sample_latent,
                 condition=anchor_condition,
-                condition_heatmap=anchor_condition_heatmap,
+                landmark_coords=anchor_landmark_coords,
                 condition_mode=condition_mode,
                 num_steps=num_steps,
                 detach_prev_state=detach_prev_state,
@@ -268,7 +268,7 @@ def main(argv: list[str] | None = None) -> None:
                 model,
                 latent=anchor_latent,
                 condition=sample_condition,
-                condition_heatmap=sample_condition_heatmap,
+                landmark_coords=sample_landmark_coords,
                 condition_mode=condition_mode,
                 num_steps=num_steps,
                 detach_prev_state=detach_prev_state,

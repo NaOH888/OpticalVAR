@@ -378,7 +378,7 @@ def _build_condition_layer(config: dict[str, Any]) -> tuple[ConditionEmbeddingLa
     condition_embed_dim = int(encoder_cfg.get("condition_embed_dim", 128))
     resolved_mode = "class_index" if condition_mode is None else str(condition_mode)
     condition_input_dim = encoder_cfg.get("condition_input_dim")
-    if _condition_heatmap_enabled(config) and resolved_mode == "attribute_vector":
+    if _condition_landmark_film_enabled(config) and resolved_mode == "attribute_vector":
         condition_input_dim = int(encoder_cfg["condition_attribute_dim"])
     layer = ConditionEmbeddingLayer(
         mode=resolved_mode,
@@ -391,32 +391,9 @@ def _build_condition_layer(config: dict[str, Any]) -> tuple[ConditionEmbeddingLa
     return layer, condition_embed_dim
 
 
-def _condition_heatmap_enabled(config: dict[str, Any]) -> bool:
+def _condition_landmark_film_enabled(config: dict[str, Any]) -> bool:
     encoder_cfg = dict(config["encoder"])
-    return bool(encoder_cfg.get("use_landmark_heatmap", False))
-
-
-def _build_landmark_heatmap_batch(
-    landmarks: torch.Tensor,
-    *,
-    height: int,
-    width: int,
-    sigma_px: float,
-) -> torch.Tensor:
-    if landmarks.dim() != 2 or int(landmarks.shape[1]) % 2 != 0:
-        raise ValueError(f"landmarks must be [B,2P], got {tuple(landmarks.shape)}")
-    batch_size = int(landmarks.shape[0])
-    num_points = int(landmarks.shape[1] // 2)
-    coords = landmarks.to(dtype=torch.float32).reshape(batch_size, num_points, 2)
-    y_coords = coords[..., 1].clamp(0.0, 1.0) * float(height - 1)
-    x_coords = coords[..., 0].clamp(0.0, 1.0) * float(width - 1)
-    grid_y = torch.arange(height, device=landmarks.device, dtype=torch.float32).view(1, 1, height, 1)
-    grid_x = torch.arange(width, device=landmarks.device, dtype=torch.float32).view(1, 1, 1, width)
-    sigma_sq = float(sigma_px) ** 2
-    return torch.exp(
-        -((grid_y - y_coords.unsqueeze(-1).unsqueeze(-1)).square() + (grid_x - x_coords.unsqueeze(-1).unsqueeze(-1)).square())
-        / max(2.0 * sigma_sq, 1.0e-8)
-    )
+    return bool(encoder_cfg.get("use_landmark_film", False))
 
 
 def _build_condition_inputs(
@@ -437,25 +414,20 @@ def _build_condition_inputs(
         return class_labels, None, None
 
     condition_vector = raw_label.to(device=device, dtype=torch.float32)
-    condition_heatmap: torch.Tensor | None = None
-    if _condition_heatmap_enabled(config):
+    landmark_coords: torch.Tensor | None = None
+    if _condition_landmark_film_enabled(config):
         attr_dim = int(encoder_cfg["condition_attribute_dim"])
         landmark_dim = int(encoder_cfg["condition_landmark_dim"])
         if landmark_dim <= 0 or landmark_dim % 2 != 0:
-            raise ValueError("condition_landmark_dim must be a positive even integer when use_landmark_heatmap is enabled")
+            raise ValueError("condition_landmark_dim must be a positive even integer when use_landmark_film is enabled")
         if int(condition_vector.shape[1]) < attr_dim + landmark_dim:
             raise ValueError(
                 "attribute_vector condition does not contain enough values for "
                 f"condition_attribute_dim={attr_dim} and condition_landmark_dim={landmark_dim}"
             )
-        condition_heatmap = _build_landmark_heatmap_batch(
-            condition_vector[:, attr_dim : attr_dim + landmark_dim],
-            height=int(encoder_cfg.get("output_height")),
-            width=int(encoder_cfg.get("output_width")),
-            sigma_px=float(encoder_cfg.get("landmark_heatmap_sigma_px", 4.0)),
-        )
+        landmark_coords = condition_vector[:, attr_dim : attr_dim + landmark_dim]
         condition_vector = condition_vector[:, :attr_dim]
-    return condition_vector, condition_heatmap, raw_label.to(device=device, dtype=torch.float32)
+    return condition_vector, landmark_coords, raw_label.to(device=device, dtype=torch.float32)
 
 
 def _build_optical_decoder(config: dict[str, Any]) -> OpticalPrefixReadoutDecoder:
@@ -573,11 +545,11 @@ def _build_model(config: dict[str, Any], *, sample_item: dict[str, Any]) -> Iter
 
     iterative_cfg = dict(config["iterative"])
     encoder_cfg = dict(config["encoder"])
-    condition_heatmap_channels = 0
-    if _condition_heatmap_enabled(config):
+    landmark_coord_dim = 0
+    if _condition_landmark_film_enabled(config):
         if str(encoder_cfg.get("condition_mode")) != "attribute_vector":
-            raise ValueError("use_landmark_heatmap requires encoder.condition_mode='attribute_vector'")
-        condition_heatmap_channels = int(encoder_cfg["condition_landmark_dim"]) // 2
+            raise ValueError("use_landmark_film requires encoder.condition_mode='attribute_vector'")
+        landmark_coord_dim = int(encoder_cfg["condition_landmark_dim"])
     condition_layer, condition_embed_dim = _build_condition_layer(config)
     encoder = IterativeMultiscaleEncoder(
         latent_channels=int(latent.shape[0]),
@@ -589,7 +561,9 @@ def _build_model(config: dict[str, Any], *, sample_item: dict[str, Any]) -> Iter
         step_embedding_dim=int(iterative_cfg["step_embedding_dim"]),
         condition_layer=condition_layer,
         condition_embed_dim=condition_embed_dim,
-        condition_heatmap_channels=condition_heatmap_channels,
+        landmark_coord_dim=landmark_coord_dim,
+        landmark_fourier_bands=int(encoder_cfg.get("landmark_fourier_bands", 4)),
+        landmark_embed_dim=int(encoder_cfg.get("landmark_embed_dim", max(int(encoder_cfg.get("fusion_hidden_dim", 128)) // 2, 32))),
         latent_stage_channels=encoder_cfg.get("latent_channels"),
         prev_image_channels=encoder_cfg.get("prev_image_channels"),
         use_prev_image=bool(iterative_cfg.get("use_prev_image", True)),
@@ -794,7 +768,7 @@ def train(
             for batch_idx, batch in enumerate(loader, start=1):
                 batch = _move_batch_to_device(batch, device)
                 latent = batch["latent"].to(device=device, dtype=torch.float32)
-                condition, condition_heatmap, condition_signal = _build_condition_inputs(
+                condition, landmark_coords, condition_signal = _build_condition_inputs(
                     batch,
                     config=config,
                     device=device,
@@ -803,7 +777,7 @@ def train(
                     latent=latent,
                     condition=condition if config["encoder"].get("condition_mode") == "attribute_vector" else None,
                     class_labels=condition if config["encoder"].get("condition_mode") != "attribute_vector" else None,
-                    condition_heatmap=condition_heatmap,
+                    landmark_coords=landmark_coords,
                     num_steps=num_steps,
                     detach_prev_state=bool(iterative_cfg.get("detach_prev_state", False)),
                 )

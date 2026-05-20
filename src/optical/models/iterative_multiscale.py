@@ -30,7 +30,9 @@ class IterativeMultiscaleEncoder(nn.Module):
         step_embedding_dim: int,
         condition_layer: ConditionEmbeddingLayer | None = None,
         condition_embed_dim: int | None = None,
-        condition_heatmap_channels: int = 0,
+        landmark_coord_dim: int = 0,
+        landmark_fourier_bands: int = 4,
+        landmark_embed_dim: int = 64,
         latent_stage_channels: Sequence[int] | None = None,
         prev_image_channels: Sequence[int] | None = None,
         use_prev_image: bool = True,
@@ -50,7 +52,9 @@ class IterativeMultiscaleEncoder(nn.Module):
         self.step_embedding_dim = int(step_embedding_dim)
         self.condition_layer = condition_layer
         self.condition_embed_dim = None if condition_embed_dim is None else int(condition_embed_dim)
-        self.condition_heatmap_channels = int(condition_heatmap_channels)
+        self.landmark_coord_dim = int(landmark_coord_dim)
+        self.landmark_fourier_bands = int(landmark_fourier_bands)
+        self.landmark_embed_dim = int(landmark_embed_dim)
         self.use_prev_image = bool(use_prev_image)
         self.fusion_hidden_dim = int(fusion_hidden_dim)
         self.dropout_prob = float(dropout_prob)
@@ -74,8 +78,12 @@ class IterativeMultiscaleEncoder(nn.Module):
             raise ValueError("condition_embed_dim must be omitted when condition_layer is disabled")
         if self.condition_layer is not None and (self.condition_embed_dim is None or self.condition_embed_dim <= 0):
             raise ValueError("condition_embed_dim must be positive when conditioning is enabled")
-        if self.condition_heatmap_channels < 0:
-            raise ValueError("condition_heatmap_channels must be non-negative")
+        if self.landmark_coord_dim < 0:
+            raise ValueError("landmark_coord_dim must be non-negative")
+        if self.landmark_fourier_bands <= 0:
+            raise ValueError("landmark_fourier_bands must be positive")
+        if self.landmark_coord_dim > 0 and self.landmark_embed_dim <= 0:
+            raise ValueError("landmark_embed_dim must be positive when landmark conditioning is enabled")
 
         self.stage_sizes = _build_spatial_stage_sizes(
             input_height=self.latent_height,
@@ -130,25 +138,22 @@ class IterativeMultiscaleEncoder(nn.Module):
             ]
         )
         self.shared_dropout = nn.Dropout2d(p=self.dropout_prob) if self.dropout_prob > 0.0 else nn.Identity()
-        if self.condition_heatmap_channels > 0:
-            spatial_hidden_channels = max(16, self.latent_stage_channels[-1] // 2)
-            self.condition_heatmap_stem = nn.Conv2d(
-                self.condition_heatmap_channels,
-                spatial_hidden_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                bias=True,
+        if self.landmark_coord_dim > 0:
+            landmark_feature_dim = 2 * self.landmark_coord_dim * self.landmark_fourier_bands
+            self.landmark_embedder = nn.Sequential(
+                nn.Linear(landmark_feature_dim, self.landmark_embed_dim),
+                nn.SiLU(),
+                nn.Linear(self.landmark_embed_dim, self.landmark_embed_dim),
             )
-            self.condition_heatmap_projector = nn.Conv2d(
-                spatial_hidden_channels,
-                self.latent_stage_channels[-1],
-                kernel_size=1,
-                bias=True,
+            self.landmark_to_modulation = nn.Linear(
+                self.landmark_embed_dim,
+                2 * self.latent_stage_channels[-1],
             )
+            self.landmark_step_gate = nn.Embedding(self.num_steps, 1)
         else:
-            self.condition_heatmap_stem = None
-            self.condition_heatmap_projector = None
+            self.landmark_embedder = None
+            self.landmark_to_modulation = None
+            self.landmark_step_gate = None
         self.init_head = nn.Conv2d(self.latent_stage_channels[-1], 1, kernel_size=1, bias=True)
 
         if self.use_prev_image:
@@ -197,10 +202,14 @@ class IterativeMultiscaleEncoder(nn.Module):
             _init_linear_or_conv(block.pointwise, self.weight_init)
             if block.modulation is not None:
                 _init_linear_or_conv(block.modulation.projector, self.weight_init)
-        if self.condition_heatmap_stem is not None:
-            _init_linear_or_conv(self.condition_heatmap_stem, self.weight_init)
-        if self.condition_heatmap_projector is not None:
-            _init_linear_or_conv(self.condition_heatmap_projector, self.weight_init)
+        if self.landmark_embedder is not None:
+            for module in self.landmark_embedder:
+                if isinstance(module, nn.Linear):
+                    _init_linear_or_conv(module, self.weight_init)
+        if self.landmark_to_modulation is not None:
+            _init_linear_or_conv(self.landmark_to_modulation, self.weight_init)
+        if self.landmark_step_gate is not None:
+            nn.init.zeros_(self.landmark_step_gate.weight)
         if self.prev_stem is not None:
             _init_linear_or_conv(self.prev_stem, self.weight_init)
         if self.prev_blocks is not None:
@@ -276,6 +285,42 @@ class IterativeMultiscaleEncoder(nn.Module):
             fused_input = torch.cat([condition_base, timestep_repr], dim=1)
         return self.conditioning_projector(fused_input.to(dtype=torch.float32))
 
+    def _encode_landmarks(self, landmark_coords: torch.Tensor) -> torch.Tensor:
+        if self.landmark_coord_dim == 0 or self.landmark_embedder is None:
+            raise RuntimeError("_encode_landmarks should not be called when landmark conditioning is disabled")
+        if landmark_coords.dim() != 2 or int(landmark_coords.shape[1]) != self.landmark_coord_dim:
+            raise ValueError(
+                f"landmark_coords must be [B,{self.landmark_coord_dim}], got {tuple(landmark_coords.shape)}"
+            )
+        coords = landmark_coords.to(dtype=torch.float32)
+        bands = (2.0 ** torch.arange(self.landmark_fourier_bands, device=coords.device, dtype=coords.dtype)) * torch.pi
+        scaled = coords.unsqueeze(-1) * bands.view(1, 1, -1)
+        encoded = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=-1).reshape(coords.shape[0], -1)
+        return self.landmark_embedder(encoded)
+
+    def _apply_landmark_modulation(
+        self,
+        *,
+        features: torch.Tensor,
+        timesteps: torch.Tensor | int,
+        landmark_repr: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if landmark_repr is None:
+            return features
+        if self.landmark_to_modulation is None or self.landmark_step_gate is None:
+            raise RuntimeError("landmark modulation layers must be initialized when landmark conditioning is enabled")
+        if isinstance(timesteps, int):
+            step_tensor = torch.full((features.shape[0],), int(timesteps), device=features.device, dtype=torch.long)
+        else:
+            step_tensor = timesteps.to(device=features.device, dtype=torch.long).reshape(-1)
+        gate = torch.sigmoid(self.landmark_step_gate(step_tensor)).view(features.shape[0], 1, 1, 1)
+        modulation = self.landmark_to_modulation(landmark_repr.to(device=features.device, dtype=torch.float32))
+        scale, shift = modulation.chunk(2, dim=1)
+        scale = scale.view(features.shape[0], -1, 1, 1).to(dtype=features.dtype)
+        shift = shift.view(features.shape[0], -1, 1, 1).to(dtype=features.dtype)
+        gate = gate.to(dtype=features.dtype)
+        return (1.0 + gate * scale) * features + gate * shift
+
     @staticmethod
     def _is_first_step(timesteps: torch.Tensor | int) -> bool:
         if isinstance(timesteps, int):
@@ -287,7 +332,6 @@ class IterativeMultiscaleEncoder(nn.Module):
         *,
         latent_base: torch.Tensor,
         conditioning_repr: torch.Tensor,
-        condition_heatmap: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden = latent_base
         for index, (target_size, block) in enumerate(zip(self.stage_sizes, self.shared_blocks)):
@@ -295,12 +339,6 @@ class IterativeMultiscaleEncoder(nn.Module):
             hidden = self.stage_projectors[index](hidden)
             hidden = block(hidden, conditioning_repr)
             hidden = self.shared_dropout(hidden)
-        if condition_heatmap is not None:
-            if self.condition_heatmap_stem is None or self.condition_heatmap_projector is None:
-                raise RuntimeError("condition heatmap branch is not initialized")
-            spatial = self.condition_heatmap_stem(condition_heatmap.to(dtype=torch.float32))
-            spatial = _interpolate_like(spatial, size=self.stage_sizes[-1], mode=self.upsample_mode)
-            hidden = hidden + self.condition_heatmap_projector(spatial)
         return hidden
 
     def _encode_prev_image(self, prev_image: torch.Tensor) -> torch.Tensor:
@@ -326,7 +364,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         latent_base: torch.Tensor,
         timesteps: torch.Tensor | int,
         condition_base: torch.Tensor | None = None,
-        condition_heatmap: torch.Tensor | None = None,
+        landmark_coords: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if latent_base.dim() != 4 or int(latent_base.shape[1]) != self.latent_stage_channels[0]:
             raise ValueError(
@@ -343,7 +381,12 @@ class IterativeMultiscaleEncoder(nn.Module):
         shared_features = self._forward_shared_features(
             latent_base=latent_base,
             conditioning_repr=conditioning_repr,
-            condition_heatmap=condition_heatmap,
+        )
+        landmark_repr = None if landmark_coords is None else self._encode_landmarks(landmark_coords)
+        shared_features = self._apply_landmark_modulation(
+            features=shared_features,
+            timesteps=timesteps,
+            landmark_repr=landmark_repr,
         )
         if self._is_first_step(timesteps) or not self.use_prev_image:
             return self.init_head(shared_features)
@@ -363,7 +406,7 @@ class IterativeMultiscaleEncoder(nn.Module):
         timesteps: torch.Tensor | int,
         class_labels: torch.Tensor | None = None,
         condition: torch.Tensor | None = None,
-        condition_heatmap: torch.Tensor | None = None,
+        landmark_coords: torch.Tensor | None = None,
     ) -> torch.Tensor:
         latent_base = self.encode_latent(latent)
         condition_base = self.encode_condition_base(
@@ -376,7 +419,7 @@ class IterativeMultiscaleEncoder(nn.Module):
             latent_base=latent_base,
             timesteps=timesteps,
             condition_base=condition_base,
-            condition_heatmap=condition_heatmap,
+            landmark_coords=landmark_coords,
         )
 
 
@@ -447,7 +490,7 @@ class IterativeMultiscaleOpticalModel(nn.Module):
         step_id: torch.Tensor | int,
         class_labels: torch.Tensor | None = None,
         condition: torch.Tensor | None = None,
-        condition_heatmap: torch.Tensor | None = None,
+        landmark_coords: torch.Tensor | None = None,
         error_factor: float | None = None,
     ) -> dict[str, torch.Tensor]:
         prev_image = self._to_image(prev_image)
@@ -462,7 +505,7 @@ class IterativeMultiscaleOpticalModel(nn.Module):
             latent_base=latent_base,
             timesteps=step_id,
             condition_base=condition_base,
-            condition_heatmap=condition_heatmap,
+            landmark_coords=landmark_coords,
         )
         prediction = self.decoder(control_map, error_factor=error_factor)["final_detector"]
         return {
@@ -477,7 +520,7 @@ class IterativeMultiscaleOpticalModel(nn.Module):
         num_steps: int,
         class_labels: torch.Tensor | None = None,
         condition: torch.Tensor | None = None,
-        condition_heatmap: torch.Tensor | None = None,
+        landmark_coords: torch.Tensor | None = None,
         initial_state: torch.Tensor | None = None,
         error_factor: float | None = None,
         detach_prev_state: bool = False,
@@ -507,7 +550,7 @@ class IterativeMultiscaleOpticalModel(nn.Module):
                 latent_base=latent_base,
                 timesteps=step_index,
                 condition_base=condition_base,
-                condition_heatmap=condition_heatmap,
+                landmark_coords=landmark_coords,
             )
             prediction = self.decoder(control_map, error_factor=error_factor)["final_detector"]
             normalized_state = self.normalize_state(prediction)

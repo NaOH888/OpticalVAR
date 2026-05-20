@@ -221,7 +221,7 @@ class IterativeMultiscaleModelTests(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (2, 1, 8, 8))
         self.assertTrue(torch.isfinite(output).all().item())
 
-    def test_iterative_encoder_supports_condition_heatmap_branch(self) -> None:
+    def test_iterative_encoder_supports_landmark_film_branch(self) -> None:
         encoder = IterativeMultiscaleEncoder(
             latent_channels=4,
             latent_height=2,
@@ -237,7 +237,9 @@ class IterativeMultiscaleModelTests(unittest.TestCase):
                 hidden_dim=16,
             ),
             condition_embed_dim=12,
-            condition_heatmap_channels=5,
+            landmark_coord_dim=4,
+            landmark_fourier_bands=3,
+            landmark_embed_dim=12,
             latent_stage_channels=(24, 16, 12),
             prev_image_channels=(12, 8),
             fusion_hidden_dim=16,
@@ -245,11 +247,11 @@ class IterativeMultiscaleModelTests(unittest.TestCase):
         prev = torch.rand((2, 1, 8, 8), dtype=torch.float32)
         latent = torch.rand((2, 4, 2, 2), dtype=torch.float32)
         condition = torch.rand((2, 4), dtype=torch.float32)
-        heatmap_a = torch.rand((2, 5, 8, 8), dtype=torch.float32)
-        heatmap_b = torch.zeros((2, 5, 8, 8), dtype=torch.float32)
+        landmark_a = torch.rand((2, 4), dtype=torch.float32)
+        landmark_b = torch.zeros((2, 4), dtype=torch.float32)
 
-        output_a = encoder(prev_image=prev, latent=latent, timesteps=1, condition=condition, condition_heatmap=heatmap_a)
-        output_b = encoder(prev_image=prev, latent=latent, timesteps=1, condition=condition, condition_heatmap=heatmap_b)
+        output_a = encoder(prev_image=prev, latent=latent, timesteps=1, condition=condition, landmark_coords=landmark_a)
+        output_b = encoder(prev_image=prev, latent=latent, timesteps=1, condition=condition, landmark_coords=landmark_b)
 
         self.assertEqual(tuple(output_a.shape), (2, 1, 8, 8))
         self.assertFalse(torch.allclose(output_a, output_b))
