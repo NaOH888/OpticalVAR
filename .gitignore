@@ -16,3 +16,5 @@ dataset/fashionmnist_cvae_pairs/
 dataset/600nm_Si_1000nm_SiO2/
 dataset/fashionmnist/
 
+# Local-only training configs
+configs/*.local.json
