@@ -238,6 +238,25 @@ class TrainOpticalMultiscaleScriptTests(unittest.TestCase):
             self.assertEqual(group_lrs["encoder"], 2.0e-4)
             self.assertEqual(group_lrs["decoder"], 5.0e-4)
 
+    def test_build_model_supports_optional_latent_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            _, _, config_path = self._write_tiny_training_case(tmp_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["encoder"]["use_latent_adapter"] = True
+            config["encoder"]["latent_adapter_channels"] = 12
+            config["encoder"]["latent_adapter_depth"] = 2
+            sample_item = {
+                "target_final": torch.zeros((1, 8, 8), dtype=torch.float32),
+                "latent": torch.zeros((1, 8, 8), dtype=torch.float32),
+            }
+
+            model = _build_model(config, sample_item=sample_item)
+
+            self.assertTrue(bool(model.encoder.use_latent_adapter))
+            self.assertEqual(int(model.encoder.latent_adapter_channels), 12)
+            self.assertEqual(int(model.encoder.latent_adapter_depth), 2)
+
     def test_fixed_latent_depends_on_sample_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

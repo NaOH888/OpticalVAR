@@ -192,6 +192,9 @@ class SpatialPhaseMapEncoder(nn.Module):
         phase_alpha_pi: float = 2.0,
         condition_layer: ConditionEmbeddingLayer | None = None,
         condition_dim: int | None = None,
+        use_latent_adapter: bool = False,
+        latent_adapter_channels: int = 32,
+        latent_adapter_depth: int = 2,
         weight_init: str = "kaiming_uniform",
         output_weight_init: str = "xavier_uniform",
         apply_wrap: bool = True,
@@ -207,6 +210,9 @@ class SpatialPhaseMapEncoder(nn.Module):
         self.phase_alpha_pi = float(phase_alpha_pi)
         self.condition_layer = condition_layer
         self.condition_dim = None if condition_dim is None else int(condition_dim)
+        self.use_latent_adapter = bool(use_latent_adapter)
+        self.latent_adapter_channels = int(latent_adapter_channels)
+        self.latent_adapter_depth = int(latent_adapter_depth)
         self.weight_init = str(weight_init)
         self.output_weight_init = str(output_weight_init)
         self.apply_wrap = bool(apply_wrap)
@@ -224,6 +230,10 @@ class SpatialPhaseMapEncoder(nn.Module):
             raise ValueError("condition_dim must be omitted when condition_layer is disabled")
         if self.condition_layer is not None and (self.condition_dim is None or self.condition_dim <= 0):
             raise ValueError("condition_dim must be positive when condition_layer is enabled")
+        if self.use_latent_adapter and self.latent_adapter_channels <= 0:
+            raise ValueError("latent_adapter_channels must be positive when latent adapter is enabled")
+        if self.use_latent_adapter and self.latent_adapter_depth <= 0:
+            raise ValueError("latent_adapter_depth must be positive when latent adapter is enabled")
 
         self.stage_sizes = _build_spatial_stage_sizes(
             input_height=self.input_height,
@@ -236,6 +246,34 @@ class SpatialPhaseMapEncoder(nn.Module):
             hidden_dim=self.hidden_dim,
             hidden_channels=hidden_channels,
         )
+
+        if self.use_latent_adapter:
+            self.latent_adapter_stem = nn.Conv2d(
+                self.input_channels,
+                self.latent_adapter_channels,
+                kernel_size=1,
+                bias=True,
+            )
+            self.latent_adapter_blocks = nn.ModuleList(
+                [
+                    _DepthwisePointwiseBlock(
+                        in_channels=self.latent_adapter_channels,
+                        out_channels=self.latent_adapter_channels,
+                        condition_dim=None,
+                    )
+                    for _ in range(self.latent_adapter_depth)
+                ]
+            )
+            self.latent_adapter_head = nn.Conv2d(
+                self.latent_adapter_channels,
+                self.input_channels,
+                kernel_size=1,
+                bias=True,
+            )
+        else:
+            self.latent_adapter_stem = None
+            self.latent_adapter_blocks = None
+            self.latent_adapter_head = None
 
         self.stem = nn.Conv2d(self.input_channels, self.hidden_channels[0], kernel_size=1, bias=True)
         blocks: list[nn.Module] = []
@@ -257,6 +295,16 @@ class SpatialPhaseMapEncoder(nn.Module):
         return float(self.phase_alpha_pi * math.pi)
 
     def _reset_parameters(self) -> None:
+        if self.latent_adapter_stem is not None:
+            _init_linear_or_conv(self.latent_adapter_stem, self.weight_init)
+        if self.latent_adapter_blocks is not None:
+            for block in self.latent_adapter_blocks:
+                _init_linear_or_conv(block.depthwise, self.weight_init)
+                _init_linear_or_conv(block.pointwise, self.weight_init)
+        if self.latent_adapter_head is not None:
+            init.zeros_(self.latent_adapter_head.weight)
+            if self.latent_adapter_head.bias is not None:
+                init.zeros_(self.latent_adapter_head.bias)
         _init_linear_or_conv(self.stem, self.weight_init)
         for block in self.blocks:
             if not isinstance(block, _DepthwisePointwiseBlock):
@@ -310,7 +358,17 @@ class SpatialPhaseMapEncoder(nn.Module):
         elif class_labels is not None or condition is not None:
             raise ValueError("condition must not be provided when conditioning is disabled")
 
-        hidden = self.stem(sample.to(dtype=torch.float32))
+        latent_input = sample.to(dtype=torch.float32)
+        if self.latent_adapter_stem is not None:
+            adapter_hidden = self.latent_adapter_stem(latent_input)
+            if self.latent_adapter_blocks is not None:
+                for block in self.latent_adapter_blocks:
+                    adapter_hidden = block(adapter_hidden, None)
+            if self.latent_adapter_head is None:
+                raise RuntimeError("latent_adapter_head must be initialized when latent adapter is enabled")
+            latent_input = latent_input + self.latent_adapter_head(adapter_hidden)
+
+        hidden = self.stem(latent_input)
         for index, block in enumerate(self.blocks):
             target_size = self.stage_sizes[index]
             hidden = _interpolate_like(hidden, size=target_size, mode=self.upsample_mode)

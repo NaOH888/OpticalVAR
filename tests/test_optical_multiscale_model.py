@@ -90,6 +90,30 @@ class OpticalMultiscaleModelTests(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (2, 1, 4, 4))
         self.assertTrue(torch.isfinite(output).all().item())
 
+    def test_spatial_phase_map_encoder_supports_optional_latent_adapter(self) -> None:
+        encoder = SpatialPhaseMapEncoder(
+            input_channels=4,
+            input_height=2,
+            input_width=2,
+            output_height=4,
+            output_width=4,
+            hidden_dim=32,
+            use_latent_adapter=True,
+            latent_adapter_channels=8,
+            latent_adapter_depth=2,
+        )
+        sample = torch.rand((2, 4, 2, 2), dtype=torch.float32)
+
+        baseline = encoder(sample)
+        self.assertEqual(tuple(baseline.shape), (2, 1, 4, 4))
+        self.assertTrue(torch.isfinite(baseline).all().item())
+
+        with torch.no_grad():
+            encoder.latent_adapter_head.bias.fill_(0.1)
+        shifted = encoder(sample)
+
+        self.assertFalse(torch.allclose(baseline, shifted))
+
     def test_prefix_readout_decoder_returns_detector_plane_prefixes(self) -> None:
         source_config = SourceConfig(
             wavelengths_m=(532e-9,),
